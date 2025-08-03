@@ -177,13 +177,13 @@ void planner_task(void *arg)
 
     while (1)
     {
-        uint32_t move1[MOTOR_COUNT] = {1000, 2000, 3000};
-        start_synchronized_move(move1, 2.0f); // 2 segundos
+        uint32_t move1[MOTOR_COUNT] = {200, 200, 200};
+        start_synchronized_move(move1, 1.0f); // 2 segundos
 
         vTaskDelay(pdMS_TO_TICKS(3000));
 
-        uint32_t move2[MOTOR_COUNT] = {3000, 1500, 500};
-        start_synchronized_move(move2, 2.0f);
+        uint32_t move2[MOTOR_COUNT] = {300, 200, 200};
+        start_synchronized_move(move2, 1.0f);
 
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
