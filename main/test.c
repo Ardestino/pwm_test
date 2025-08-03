@@ -6,7 +6,7 @@
 
 #define MOTOR_COUNT 3
 #define MCPWM_RES_HZ 1000000 // 1 MHz resolución
-#define STEP_PINS {25, 26, 27}
+#define STEP_PINS {27, 33, 19}
 #define TAG "SYNC_TIMERS"
 
 typedef struct
