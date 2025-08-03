@@ -31,7 +31,7 @@ static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer, const mcpwm_tim
     
     for (int i = 0; i < MOTOR_COUNT; i++) {
         if (motors[i].active) {
-            // Verificar si es tiempo de dar el siguiente paso
+            // Verificar si es tiempo de dar el siguiente paso para ESTE motor específico
             if (timer_counter >= motors[i].next_step_time) {
                 motors[i].current_step++;
                 motors[i].next_step_time += motors[i].step_interval;
@@ -40,6 +40,7 @@ static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer, const mcpwm_tim
                 if (motors[i].current_step >= motors[i].target_steps) {
                     motors[i].active = false;
                     mcpwm_generator_set_force_level(motors[i].gen, 0, true);
+                    // NO usar ESP_LOGI en ISR!
                 }
             }
         }
@@ -56,6 +57,7 @@ static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer, const mcpwm_tim
     
     if (!any_active) {
         timer_counter = 0;
+        // NO usar ESP_LOGI en ISR!
         return true; // Stop timer
     }
     
@@ -148,6 +150,9 @@ void synchronized_move(uint32_t step_targets[], uint32_t duration_us)
             
             ESP_LOGI(TAG, "Motor %d: %lu pasos, %.2f Hz, intervalo %.2f ticks", 
                      i, step_targets[i], motor_freq, motors[i].step_interval);
+        } else {
+            motors[i].step_interval = 0;
+            motors[i].next_step_time = 0;
         }
     }
 
@@ -178,7 +183,10 @@ void synchronized_move(uint32_t step_targets[], uint32_t duration_us)
                 break;
             }
         }
-        if (!any_active) break;
+        if (!any_active) {
+            ESP_LOGI(TAG, "Todos los motores completados");
+            break;
+        }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
