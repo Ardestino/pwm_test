@@ -14,34 +14,36 @@ typedef struct {
     mcpwm_cmpr_handle_t cmp;
     uint32_t target_steps;
     volatile uint32_t current_step;
+    float step_interval;  // Intervalo entre pasos para este motor
+    volatile float next_step_time;  // Tiempo para el próximo paso
     bool active;
 } motor_control_t;
 
 motor_control_t motors[MOTOR_COUNT];
 mcpwm_timer_handle_t shared_timer;
 const int step_pins[MOTOR_COUNT] = STEP_PINS;
+volatile uint32_t timer_counter = 0;
 
-// Callback del timer para contar pasos
+// Callback del timer - ahora maneja diferentes frecuencias por motor
 static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *edata, void *user_ctx)
 {
-    static uint32_t step_counter = 0;
+    timer_counter++;
     
     for (int i = 0; i < MOTOR_COUNT; i++) {
         if (motors[i].active) {
-            float progress = (float)step_counter / motors[i].target_steps;
-            
-            if (step_counter < motors[i].target_steps) {
-                // Motor sigue activo
-                motors[i].current_step = step_counter;
-            } else {
-                // Motor completó sus pasos, desactivar
-                motors[i].active = false;
-                mcpwm_generator_set_force_level(motors[i].gen, 0, true);
+            // Verificar si es tiempo de dar el siguiente paso
+            if (timer_counter >= motors[i].next_step_time) {
+                motors[i].current_step++;
+                motors[i].next_step_time += motors[i].step_interval;
+                
+                // Verificar si el motor completó sus pasos
+                if (motors[i].current_step >= motors[i].target_steps) {
+                    motors[i].active = false;
+                    mcpwm_generator_set_force_level(motors[i].gen, 0, true);
+                }
             }
         }
     }
-    
-    step_counter++;
     
     // Verificar si todos los motores terminaron
     bool any_active = false;
@@ -53,7 +55,7 @@ static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer, const mcpwm_tim
     }
     
     if (!any_active) {
-        step_counter = 0;
+        timer_counter = 0;
         return true; // Stop timer
     }
     
@@ -62,11 +64,11 @@ static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer, const mcpwm_tim
 
 void setup_mcpwm()
 {
-    // 1. MCPWM timer (shared)
+    // 1. MCPWM timer (shared) - frecuencia base alta para precisión
     mcpwm_timer_config_t timer_cfg = {
         .group_id = 0,
         .resolution_hz = MCPWM_RES_HZ,
-        .period_ticks = 1000,  // Se ajustará dinámicamente
+        .period_ticks = 100,  // 100kHz de frecuencia base para precisión
         .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
         .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
     };
@@ -126,25 +128,35 @@ void set_generator_50_percent(int i, uint32_t period_ticks)
 
 void synchronized_move(uint32_t step_targets[], uint32_t duration_us)
 {
-    // 1. Encontrar el motor con más pasos
+    // 1. Configurar cada motor con su propia frecuencia
     uint32_t max_steps = 0;
+    const float base_timer_freq = 100000.0f; // 100kHz timer base
+    
     for (int i = 0; i < MOTOR_COUNT; i++) {
         motors[i].target_steps = step_targets[i];
         motors[i].current_step = 0;
         motors[i].active = (step_targets[i] > 0);
+        
         if (step_targets[i] > max_steps) max_steps = step_targets[i];
+        
+        if (motors[i].active) {
+            // Calcular frecuencia específica para este motor
+            float motor_freq = (float)step_targets[i] * 1000000.0f / duration_us;
+            // Intervalo entre pasos en términos de ticks del timer base
+            motors[i].step_interval = base_timer_freq / motor_freq;
+            motors[i].next_step_time = motors[i].step_interval;
+            
+            ESP_LOGI(TAG, "Motor %d: %lu pasos, %.2f Hz, intervalo %.2f ticks", 
+                     i, step_targets[i], motor_freq, motors[i].step_interval);
+        }
     }
 
     if (max_steps == 0) return;
-
-    // 2. Calcular frecuencia y periodo
-    float base_freq = (float)max_steps * 1000000.0f / duration_us;
-    uint32_t period_ticks = (uint32_t)(MCPWM_RES_HZ / base_freq);
     
-    ESP_LOGI(TAG, "Movimiento: %lu pasos máx, %.2f Hz, %lu ticks", max_steps, base_freq, period_ticks);
+    ESP_LOGI(TAG, "Movimiento sincronizado: %lu pasos máx, duración %lu us", max_steps, duration_us);
 
-    // 3. Configurar timer y generadores
-    ESP_ERROR_CHECK(mcpwm_timer_set_period(shared_timer, period_ticks));
+    // 2. Configurar generadores con periodo fijo pequeño
+    uint32_t period_ticks = 50; // Periodo corto para pulsos rápidos
     for (int i = 0; i < MOTOR_COUNT; i++) {
         if (motors[i].active) {
             set_generator_50_percent(i, period_ticks);
@@ -153,10 +165,11 @@ void synchronized_move(uint32_t step_targets[], uint32_t duration_us)
         }
     }
 
-    // 4. Iniciar movimiento
+    // 3. Reset contador y iniciar movimiento
+    timer_counter = 0;
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(shared_timer, MCPWM_TIMER_START_NO_STOP));
     
-    // 5. Esperar a que termine (usando callback)
+    // 4. Esperar a que termine
     while (true) {
         bool any_active = false;
         for (int i = 0; i < MOTOR_COUNT; i++) {
@@ -169,8 +182,10 @@ void synchronized_move(uint32_t step_targets[], uint32_t duration_us)
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    // 6. Detener timer
+    // 5. Detener timer
     ESP_ERROR_CHECK(mcpwm_timer_start_stop(shared_timer, MCPWM_TIMER_STOP_EMPTY));
+    
+    ESP_LOGI(TAG, "Movimiento completado");
 }
 
 void planner_task(void *arg)
@@ -179,13 +194,33 @@ void planner_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(500));
 
     while (1) {
-        uint32_t move1[MOTOR_COUNT] = {1000, 2000, 3000}; // Corregido: solo 3 motores
-        synchronized_move(move1, 200000); // 200 ms
-        vTaskDelay(pdMS_TO_TICKS(300));
+        ESP_LOGI(TAG, "=== Movimiento 1 ===");
+        uint32_t move1[MOTOR_COUNT] = {1000, 2000, 3000};
+        synchronized_move(move1, 2000000); // 2 segundos para ver mejor
+        
+        // Asegurar que todos los motores estén en bajo
+        ESP_LOGI(TAG, "Forzando todos los motores a LOW...");
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            mcpwm_generator_set_force_level(motors[i].gen, 0, true);
+        }
+        
+        // Delay largo para comparar visualmente
+        ESP_LOGI(TAG, "Esperando 3 segundos con pulsos en BAJO...");
+        vTaskDelay(pdMS_TO_TICKS(3000));
 
-        uint32_t move2[MOTOR_COUNT] = {3000, 2000, 1000}; // Corregido: solo 3 motores
-        synchronized_move(move2, 200000);
-        vTaskDelay(pdMS_TO_TICKS(300));
+        ESP_LOGI(TAG, "=== Movimiento 2 ===");
+        uint32_t move2[MOTOR_COUNT] = {3000, 1500, 500};
+        synchronized_move(move2, 2000000); // Diferentes pasos, mismo tiempo
+        
+        // Asegurar que todos los motores estén en bajo
+        ESP_LOGI(TAG, "Forzando todos los motores a LOW...");
+        for (int i = 0; i < MOTOR_COUNT; i++) {
+            mcpwm_generator_set_force_level(motors[i].gen, 0, true);
+        }
+        
+        // Delay largo para comparar visualmente
+        ESP_LOGI(TAG, "Esperando 3 segundos con pulsos en BAJO...");
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
 
