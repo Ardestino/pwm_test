@@ -5,229 +5,186 @@
 #include "esp_log.h"
 
 #define MOTOR_COUNT 3
-#define MCPWM_RES_HZ 10000000  // 10 MHz
+#define MCPWM_RES_HZ 1000000 // 1 MHz resolución
 #define STEP_PINS {25, 26, 27}
-#define TAG "SYNC_MOTORS"
+#define TAG "SYNC_TIMERS"
 
-typedef struct {
+typedef struct
+{
+    mcpwm_timer_handle_t timer;
+    mcpwm_oper_handle_t oper;
     mcpwm_gen_handle_t gen;
     mcpwm_cmpr_handle_t cmp;
     uint32_t target_steps;
-    volatile uint32_t current_step;
-    float step_interval;  // Intervalo entre pasos para este motor
-    volatile float next_step_time;  // Tiempo para el próximo paso
+    uint32_t step_count;
     bool active;
 } motor_control_t;
 
 motor_control_t motors[MOTOR_COUNT];
-mcpwm_timer_handle_t shared_timer;
 const int step_pins[MOTOR_COUNT] = STEP_PINS;
-volatile uint32_t timer_counter = 0;
 
-// Callback del timer - ahora maneja diferentes frecuencias por motor
-static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *edata, void *user_ctx)
+static bool IRAM_ATTR motor_timer_callback(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *edata, void *user_ctx)
 {
-    timer_counter++;
-    
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        if (motors[i].active) {
-            // Verificar si es tiempo de dar el siguiente paso para ESTE motor específico
-            if (timer_counter >= motors[i].next_step_time) {
-                motors[i].current_step++;
-                motors[i].next_step_time += motors[i].step_interval;
-                
-                // Verificar si el motor completó sus pasos
-                if (motors[i].current_step >= motors[i].target_steps) {
-                    motors[i].active = false;
-                    mcpwm_generator_set_force_level(motors[i].gen, 0, true);
-                    // NO usar ESP_LOGI en ISR!
-                }
-            }
-        }
-    }
-    
-    // Verificar si todos los motores terminaron
-    bool any_active = false;
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        if (motors[i].active) {
-            any_active = true;
-            break;
-        }
-    }
-    
-    if (!any_active) {
-        timer_counter = 0;
-        // NO usar ESP_LOGI en ISR!
+    motor_control_t *motor = (motor_control_t *)user_ctx;
+
+    motor->step_count++;
+    if (motor->step_count >= motor->target_steps)
+    {
+        ESP_ERROR_CHECK(mcpwm_timer_start_stop(motor->timer, MCPWM_TIMER_STOP_EMPTY));
+
+        // ESP_LOGI(TAG, "Movimiento completado");
+
+        mcpwm_generator_set_force_level(motor->gen, 0, true);
+        motor->active = false;
         return true; // Stop timer
     }
-    
     return false;
 }
 
-void setup_mcpwm()
+void setup_motor(int index, float frequency_hz)
 {
-    // 1. MCPWM timer (shared) - frecuencia base alta para precisión
+    motor_control_t *motor = &motors[index];
+    uint32_t period_ticks = MCPWM_RES_HZ / frequency_hz;
+
+    // Timer individual para cada motor
     mcpwm_timer_config_t timer_cfg = {
         .group_id = 0,
-        .resolution_hz = MCPWM_RES_HZ,
-        .period_ticks = 100,  // 100kHz de frecuencia base para precisión
-        .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
         .clk_src = MCPWM_TIMER_CLK_SRC_DEFAULT,
+        .resolution_hz = MCPWM_RES_HZ,
+        .period_ticks = period_ticks,
+        .count_mode = MCPWM_TIMER_COUNT_MODE_UP,
     };
-    ESP_ERROR_CHECK(mcpwm_new_timer(&timer_cfg, &shared_timer));
+    ESP_ERROR_CHECK(mcpwm_new_timer(&timer_cfg, &motor->timer));
+
+    // Operador
+    mcpwm_operator_config_t oper_cfg = {.group_id = 0};
+    ESP_ERROR_CHECK(mcpwm_new_operator(&oper_cfg, &motor->oper));
+    ESP_ERROR_CHECK(mcpwm_operator_connect_timer(motor->oper, motor->timer));
+
+    // Generador
+    mcpwm_generator_config_t gen_cfg = {.gen_gpio_num = step_pins[index]};
+    ESP_ERROR_CHECK(mcpwm_new_generator(motor->oper, &gen_cfg, &motor->gen));
+
+    // Comparador
+    mcpwm_comparator_config_t cmp_cfg = {.flags.update_cmp_on_tez = true};
+    ESP_ERROR_CHECK(mcpwm_new_comparator(motor->oper, &cmp_cfg, &motor->cmp));
+    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(motor->cmp, period_ticks / 2));
+
+    // Generar pulso 50%
+    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(
+        motor->gen,
+        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
+    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(
+        motor->gen,
+        MCPWM_GEN_COMPARE_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, motor->cmp, MCPWM_GEN_ACTION_LOW)));
 
     // Registrar callback del timer
-    mcpwm_timer_event_callbacks_t timer_cbs = {
-        .on_empty = timer_callback,
+    mcpwm_timer_event_callbacks_t cbs = {
+        .on_full = motor_timer_callback,
     };
-    ESP_ERROR_CHECK(mcpwm_timer_register_event_callbacks(shared_timer, &timer_cbs, NULL));
-
-    // 2. Create operators and assign to motors
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        mcpwm_oper_handle_t oper;
-        mcpwm_operator_config_t oper_cfg = {.group_id = 0};
-        ESP_ERROR_CHECK(mcpwm_new_operator(&oper_cfg, &oper));
-        ESP_ERROR_CHECK(mcpwm_operator_connect_timer(oper, shared_timer));
-
-        // 3. Generator (STEP signal)
-        mcpwm_generator_config_t gen_cfg = {.gen_gpio_num = step_pins[i]};
-        ESP_ERROR_CHECK(mcpwm_new_generator(oper, &gen_cfg, &motors[i].gen));
-
-        // 4. Comparator
-        mcpwm_comparator_config_t cmp_cfg = {
-            .flags.update_cmp_on_tez = true,
-        };
-        ESP_ERROR_CHECK(mcpwm_new_comparator(oper, &cmp_cfg, &motors[i].cmp));
-        
-        motors[i].active = false;
-        motors[i].current_step = 0;
-    }
-
-    ESP_ERROR_CHECK(mcpwm_timer_enable(shared_timer));
+    ESP_ERROR_CHECK(mcpwm_timer_register_event_callbacks(motor->timer, &cbs, motor));
 }
 
-void set_generator_50_percent(int i, uint32_t period_ticks)
+void cleanup_motor(int index)
 {
-    uint32_t compare_ticks = period_ticks / 2;
-    ESP_ERROR_CHECK(mcpwm_comparator_set_compare_value(motors[i].cmp, compare_ticks));
-
-    // Reactivar el generador (en caso de que esté forzado)
-    ESP_ERROR_CHECK(mcpwm_generator_set_force_level(motors[i].gen, -1, true));
-
-    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_timer_event(
-        motors[i].gen,
-        MCPWM_GEN_TIMER_EVENT_ACTION(MCPWM_TIMER_DIRECTION_UP, MCPWM_TIMER_EVENT_EMPTY, MCPWM_GEN_ACTION_HIGH)));
-
-    ESP_ERROR_CHECK(mcpwm_generator_set_action_on_compare_event(
-        motors[i].gen,
-        MCPWM_GEN_COMPARE_EVENT_ACTION(
-            MCPWM_TIMER_DIRECTION_UP, 
-            motors[i].cmp, 
-            MCPWM_GEN_ACTION_LOW)
-        )
-    );
-}
-
-void synchronized_move(uint32_t step_targets[], uint32_t duration_us)
-{
-    // 1. Configurar cada motor con su propia frecuencia
-    uint32_t max_steps = 0;
-    const float base_timer_freq = 100000.0f; // 100kHz timer base
+    motor_control_t *motor = &motors[index];
     
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        motors[i].target_steps = step_targets[i];
-        motors[i].current_step = 0;
-        motors[i].active = (step_targets[i] > 0);
-        
-        if (step_targets[i] > max_steps) max_steps = step_targets[i];
-        
-        if (motors[i].active) {
-            // Calcular frecuencia específica para este motor
-            float motor_freq = (float)step_targets[i] * 1000000.0f / duration_us;
-            // Intervalo entre pasos en términos de ticks del timer base
-            motors[i].step_interval = base_timer_freq / motor_freq;
-            motors[i].next_step_time = motors[i].step_interval;
-            
-            ESP_LOGI(TAG, "Motor %d: %lu pasos, %.2f Hz, intervalo %.2f ticks", 
-                     i, step_targets[i], motor_freq, motors[i].step_interval);
-        } else {
-            motors[i].step_interval = 0;
-            motors[i].next_step_time = 0;
+    if (motor->timer) {
+        mcpwm_timer_disable(motor->timer);
+        mcpwm_del_timer(motor->timer);
+        motor->timer = NULL;
+    }
+    
+    if (motor->gen) {
+        mcpwm_del_generator(motor->gen);
+        motor->gen = NULL;
+    }
+    
+    if (motor->cmp) {
+        mcpwm_del_comparator(motor->cmp);
+        motor->cmp = NULL;
+    }
+    
+    if (motor->oper) {
+        mcpwm_del_operator(motor->oper);
+        motor->oper = NULL;
+    }
+}
+
+void start_synchronized_move(uint32_t steps[], float duration_sec)
+{
+    ESP_LOGI(TAG, "== Iniciando movimiento sincronizado ==");
+    for (int i = 0; i < MOTOR_COUNT; i++)
+    {
+        motors[i].target_steps = steps[i];
+        motors[i].step_count = 0;
+        motors[i].active = steps[i] > 0;
+
+        if (motors[i].active)
+        {
+            float freq = steps[i] / duration_sec;
+            ESP_LOGI(TAG, "Motor %d: %lu pasos, %.2f Hz", i, steps[i], freq);
+            setup_motor(i, freq);
         }
     }
 
-    if (max_steps == 0) return;
-    
-    ESP_LOGI(TAG, "Movimiento sincronizado: %lu pasos máx, duración %lu us", max_steps, duration_us);
-
-    // 2. Configurar generadores con periodo fijo pequeño
-    uint32_t period_ticks = 50; // Periodo corto para pulsos rápidos
-    for (int i = 0; i < MOTOR_COUNT; i++) {
-        if (motors[i].active) {
-            set_generator_50_percent(i, period_ticks);
-        } else {
-            mcpwm_generator_set_force_level(motors[i].gen, 0, true);
+    // Habilitar timers pero sin iniciar aún
+    for (int i = 0; i < MOTOR_COUNT; i++)
+    {
+        if (motors[i].active)
+        {
+            ESP_ERROR_CHECK(mcpwm_timer_enable(motors[i].timer));
         }
     }
 
-    // 3. Reset contador y iniciar movimiento
-    timer_counter = 0;
-    ESP_ERROR_CHECK(mcpwm_timer_start_stop(shared_timer, MCPWM_TIMER_START_NO_STOP));
-    
-    // 4. Esperar a que termine
-    while (true) {
-        bool any_active = false;
-        for (int i = 0; i < MOTOR_COUNT; i++) {
-            if (motors[i].active) {
-                any_active = true;
+    // Iniciar todos al mismo tiempo
+    for (int i = 0; i < MOTOR_COUNT; i++)
+    {
+        if (motors[i].active)
+        {
+            ESP_ERROR_CHECK(mcpwm_timer_start_stop(motors[i].timer, MCPWM_TIMER_START_NO_STOP));
+        }
+    }
+
+    // Esperar a que todos terminen
+    bool all_done = false;
+    while (!all_done)
+    {
+        all_done = true;
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            if (motors[i].active)
+            {
+                all_done = false;
                 break;
             }
-        }
-        if (!any_active) {
-            ESP_LOGI(TAG, "Todos los motores completados");
-            break;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    // 5. Detener timer
-    ESP_ERROR_CHECK(mcpwm_timer_start_stop(shared_timer, MCPWM_TIMER_STOP_EMPTY));
-    
-    ESP_LOGI(TAG, "Movimiento completado");
+    // Limpiar recursos después del movimiento
+    for (int i = 0; i < MOTOR_COUNT; i++)
+    {
+        cleanup_motor(i);
+    }
+
+    ESP_LOGI(TAG, "== Movimiento finalizado ==");
 }
 
 void planner_task(void *arg)
 {
-    setup_mcpwm();
     vTaskDelay(pdMS_TO_TICKS(500));
 
-    while (1) {
-        ESP_LOGI(TAG, "=== Movimiento 1 ===");
+    while (1)
+    {
         uint32_t move1[MOTOR_COUNT] = {1000, 2000, 3000};
-        synchronized_move(move1, 2000000); // 2 segundos para ver mejor
-        
-        // Asegurar que todos los motores estén en bajo
-        ESP_LOGI(TAG, "Forzando todos los motores a LOW...");
-        for (int i = 0; i < MOTOR_COUNT; i++) {
-            mcpwm_generator_set_force_level(motors[i].gen, 0, true);
-        }
-        
-        // Delay largo para comparar visualmente
-        ESP_LOGI(TAG, "Esperando 3 segundos con pulsos en BAJO...");
+        start_synchronized_move(move1, 2.0f); // 2 segundos
+
         vTaskDelay(pdMS_TO_TICKS(3000));
 
-        ESP_LOGI(TAG, "=== Movimiento 2 ===");
         uint32_t move2[MOTOR_COUNT] = {3000, 1500, 500};
-        synchronized_move(move2, 2000000); // Diferentes pasos, mismo tiempo
-        
-        // Asegurar que todos los motores estén en bajo
-        ESP_LOGI(TAG, "Forzando todos los motores a LOW...");
-        for (int i = 0; i < MOTOR_COUNT; i++) {
-            mcpwm_generator_set_force_level(motors[i].gen, 0, true);
-        }
-        
-        // Delay largo para comparar visualmente
-        ESP_LOGI(TAG, "Esperando 3 segundos con pulsos en BAJO...");
+        start_synchronized_move(move2, 2.0f);
+
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
 }
