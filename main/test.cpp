@@ -618,6 +618,25 @@ public:
     {
         ESP_LOGI(TAG, "== Iniciando movimiento sincronizado ==");
 
+        // Verificar si hay movimiento real
+        bool has_movement = false;
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            if (steps[i] != 0)
+            {
+                has_movement = true;
+                break;
+            }
+        }
+
+        if (!has_movement)
+        {
+            ESP_LOGI(TAG, "No hay movimiento que realizar - todos los pasos son 0");
+            ESP_LOGI(TAG, "== Movimiento finalizado ==");
+            robot_position.print_position();
+            return;
+        }
+
         // Verificar y ajustar movimiento según límites
         std::array<int32_t, MOTOR_COUNT> limited_steps = robot_position.get_limited_steps(steps);
 
@@ -677,7 +696,10 @@ public:
 
         // Esperar a que todos terminen
         bool all_done = false;
-        while (!all_done)
+        uint32_t timeout_counter = 0;
+        const uint32_t MAX_TIMEOUT = duration_sec * 1000 + 5000; // Duración + 5 segundos de margen
+
+        while (!all_done && timeout_counter < MAX_TIMEOUT)
         {
             all_done = true;
             for (const auto &motor : motors)
@@ -688,7 +710,22 @@ public:
                     break;
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(1));
+
+            // Alimentar el watchdog y dar tiempo a otras tareas
+            vTaskDelay(pdMS_TO_TICKS(10)); // Aumentado de 1ms a 10ms
+            timeout_counter += 10;
+        }
+
+        if (timeout_counter >= MAX_TIMEOUT)
+        {
+            ESP_LOGW(TAG, "Timeout en movimiento - forzando finalización");
+            for (auto &motor : motors)
+            {
+                if (motor.is_active())
+                {
+                    motor.cleanup();
+                }
+            }
         }
 
         // Limpiar recursos después del movimiento
@@ -819,12 +856,26 @@ private:
         {
             auto current = motor_system->get_current_position();
             std::array<int32_t, MOTOR_COUNT> relative_move;
+            bool has_movement = false;
+
             for (int i = 0; i < MOTOR_COUNT; i++)
             {
                 relative_move[i] = cmd.params[i] - current[i];
+                if (relative_move[i] != 0)
+                {
+                    has_movement = true;
+                }
             }
-            response << "MoveTo: [" << cmd.params[0] << "," << cmd.params[1] << "," << cmd.params[2] << "]";
-            motor_system->execute_synchronized_move(relative_move, cmd.duration);
+
+            if (!has_movement)
+            {
+                response << "MoveTo: [" << cmd.params[0] << "," << cmd.params[1] << "," << cmd.params[2] << "] - Ya en posición destino";
+            }
+            else
+            {
+                response << "MoveTo: [" << cmd.params[0] << "," << cmd.params[1] << "," << cmd.params[2] << "] (rel: [" << relative_move[0] << "," << relative_move[1] << "," << relative_move[2] << "])";
+                motor_system->execute_synchronized_move(relative_move, cmd.duration);
+            }
             break;
         }
         case Command::GET_POSITION:
