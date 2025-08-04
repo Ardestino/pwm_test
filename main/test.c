@@ -2,17 +2,19 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/mcpwm_prelude.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 
 #define MOTOR_COUNT 3
 #define MCPWM_RES_HZ 1000000 // 1 MHz resolución
 #define STEP_PINS {27, 33, 19}
+#define DIR_PINS {26, 32, 21} // Pines de dirección para cada motor
 #define TAG "SYNC_TIMERS"
 
 // Estructura para definir un movimiento
 typedef struct
 {
-    uint32_t steps[MOTOR_COUNT];
+    int32_t steps[MOTOR_COUNT]; // Pasos con signo (+ o -)
     float duration_sec;
     uint32_t delay_after_ms; // Pausa después del movimiento
 } movement_t;
@@ -26,10 +28,12 @@ typedef struct
     uint32_t target_steps;
     uint32_t step_count;
     bool active;
+    bool direction; // true = positivo, false = negativo
 } motor_control_t;
 
 motor_control_t motors[MOTOR_COUNT];
 const int step_pins[MOTOR_COUNT] = STEP_PINS;
+const int dir_pins[MOTOR_COUNT] = DIR_PINS;
 
 static bool IRAM_ATTR motor_timer_callback(mcpwm_timer_handle_t timer, const mcpwm_timer_event_data_t *edata, void *user_ctx)
 {
@@ -47,6 +51,29 @@ static bool IRAM_ATTR motor_timer_callback(mcpwm_timer_handle_t timer, const mcp
         return true; // Stop timer
     }
     return false;
+}
+
+void init_direction_pins(void)
+{
+    for (int i = 0; i < MOTOR_COUNT; i++)
+    {
+        gpio_config_t dir_conf = {
+            .pin_bit_mask = (1ULL << dir_pins[i]),
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK(gpio_config(&dir_conf));
+        gpio_set_level(dir_pins[i], 0); // Inicializar en LOW
+    }
+}
+
+void set_motor_direction(int motor_index, bool direction)
+{
+    // true = dirección positiva (HIGH), false = dirección negativa (LOW)
+    gpio_set_level(dir_pins[motor_index], direction ? 1 : 0);
+    motors[motor_index].direction = direction;
 }
 
 void setup_motor(int index, float frequency_hz)
@@ -123,20 +150,33 @@ void cleanup_motor(int index)
     }
 }
 
-void start_synchronized_move(uint32_t steps[], float duration_sec)
+void start_synchronized_move(int32_t steps[], float duration_sec)
 {
     ESP_LOGI(TAG, "== Iniciando movimiento sincronizado ==");
     for (int i = 0; i < MOTOR_COUNT; i++)
     {
-        motors[i].target_steps = steps[i];
+        // Determinar dirección y pasos absolutos
+        bool direction = steps[i] >= 0;
+        uint32_t abs_steps = abs(steps[i]);
+
+        motors[i].target_steps = abs_steps;
         motors[i].step_count = 0;
-        motors[i].active = steps[i] > 0;
+        motors[i].active = abs_steps > 0;
+        motors[i].direction = direction;
 
         if (motors[i].active)
         {
-            float freq = steps[i] / duration_sec;
-            ESP_LOGI(TAG, "Motor %d: %lu pasos, %.2f Hz", i, steps[i], freq);
+            // Configurar dirección
+            set_motor_direction(i, direction);
+
+            float freq = abs_steps / duration_sec;
+            ESP_LOGI(TAG, "Motor %d: %ld pasos (%s), %.2f Hz",
+                     i, steps[i], direction ? "+" : "-", freq);
             setup_motor(i, freq);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Motor %d: Sin movimiento", i);
         }
     }
 
@@ -190,7 +230,7 @@ void execute_movement_sequence(movement_t movements[], int num_movements)
     for (int i = 0; i < num_movements; i++)
     {
         ESP_LOGI(TAG, "Ejecutando movimiento %d/%d", i + 1, num_movements);
-        ESP_LOGI(TAG, "Pasos: [%lu, %lu, %lu], Duración: %.2fs",
+        ESP_LOGI(TAG, "Pasos: [%ld, %ld, %ld], Duración: %.2fs",
                  movements[i].steps[0], movements[i].steps[1], movements[i].steps[2],
                  movements[i].duration_sec);
 
@@ -210,14 +250,20 @@ void planner_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(500));
 
+    // Inicializar pines de dirección
+    init_direction_pins();
+    ESP_LOGI(TAG, "Pines de dirección inicializados");
+
     // Secuencia de subida completa del robot
     movement_t sequence1[] = {
-        {{0, 2100,  0}, 0.5f, 1000}, // Movimiento 1: Q2 Full
-        {{0, 0, 700}, 0.5f, 1000}, // Movimiento 2 : Q3 Full
-        {{3200, 0, 0}, 0.5f, 1000}, // Movimiento 3 : Q1 Full
+        {{0, 2100, 0}, 0.5f, 1000},     // Movimiento 1: Q2 Full positivo
+        {{0, 0, 700}, 0.5f, 1000},      // Movimiento 2: Q3 Full positivo
+        {{3200, 0, 0}, 0.5f, 1000},     // Movimiento 3: Q1 Full positivo
+        {{-1600, 0, -350}, 1.0f, 1000}, // Movimiento 4: Q1 y Q3 hacia atrás
+        {{0, -1050, 0}, 0.5f, 1000},    // Movimiento 5: Q2 hacia atrás
     };
     int num_movements = sizeof(sequence1) / sizeof(movement_t);
-    
+
     // Subir el robot
     execute_movement_sequence(sequence1, num_movements);
 
