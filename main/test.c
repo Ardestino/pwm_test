@@ -9,6 +9,14 @@
 #define STEP_PINS {27, 33, 19}
 #define TAG "SYNC_TIMERS"
 
+// Estructura para definir un movimiento
+typedef struct
+{
+    uint32_t steps[MOTOR_COUNT];
+    float duration_sec;
+    uint32_t delay_after_ms; // Pausa después del movimiento
+} movement_t;
+
 typedef struct
 {
     mcpwm_timer_handle_t timer;
@@ -88,24 +96,28 @@ void setup_motor(int index, float frequency_hz)
 void cleanup_motor(int index)
 {
     motor_control_t *motor = &motors[index];
-    
-    if (motor->timer) {
+
+    if (motor->timer)
+    {
         mcpwm_timer_disable(motor->timer);
         mcpwm_del_timer(motor->timer);
         motor->timer = NULL;
     }
-    
-    if (motor->gen) {
+
+    if (motor->gen)
+    {
         mcpwm_del_generator(motor->gen);
         motor->gen = NULL;
     }
-    
-    if (motor->cmp) {
+
+    if (motor->cmp)
+    {
         mcpwm_del_comparator(motor->cmp);
         motor->cmp = NULL;
     }
-    
-    if (motor->oper) {
+
+    if (motor->oper)
+    {
         mcpwm_del_operator(motor->oper);
         motor->oper = NULL;
     }
@@ -171,21 +183,47 @@ void start_synchronized_move(uint32_t steps[], float duration_sec)
     ESP_LOGI(TAG, "== Movimiento finalizado ==");
 }
 
+void execute_movement_sequence(movement_t movements[], int num_movements)
+{
+    ESP_LOGI(TAG, "=== Iniciando secuencia de %d movimientos ===", num_movements);
+
+    for (int i = 0; i < num_movements; i++)
+    {
+        ESP_LOGI(TAG, "Ejecutando movimiento %d/%d", i + 1, num_movements);
+        ESP_LOGI(TAG, "Pasos: [%lu, %lu, %lu], Duración: %.2fs",
+                 movements[i].steps[0], movements[i].steps[1], movements[i].steps[2],
+                 movements[i].duration_sec);
+
+        start_synchronized_move(movements[i].steps, movements[i].duration_sec);
+
+        if (movements[i].delay_after_ms > 0)
+        {
+            ESP_LOGI(TAG, "Pausa de %lu ms", movements[i].delay_after_ms);
+            vTaskDelay(pdMS_TO_TICKS(movements[i].delay_after_ms));
+        }
+    }
+
+    ESP_LOGI(TAG, "=== Secuencia completada ===");
+}
+
 void planner_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(500));
 
+    // Secuencia de subida completa del robot
+    movement_t sequence1[] = {
+        {{0, 2100,  0}, 0.5f, 1000}, // Movimiento 1: Q2 Full
+        {{0, 0, 700}, 0.5f, 1000}, // Movimiento 2 : Q3 Full
+        {{3200, 0, 0}, 0.5f, 1000}, // Movimiento 3 : Q1 Full
+    };
+    int num_movements = sizeof(sequence1) / sizeof(movement_t);
+    
+    // Subir el robot
+    execute_movement_sequence(sequence1, num_movements);
+
     while (1)
     {
-        uint32_t move1[MOTOR_COUNT] = {200, 200, 200};
-        start_synchronized_move(move1, 1.0f); // 2 segundos
-
-        vTaskDelay(pdMS_TO_TICKS(3000));
-
-        uint32_t move2[MOTOR_COUNT] = {300, 200, 200};
-        start_synchronized_move(move2, 1.0f);
-
-        vTaskDelay(pdMS_TO_TICKS(3000));
+        vTaskDelay(pdMS_TO_TICKS(100)); // Mantener la tarea activa
     }
 }
 
