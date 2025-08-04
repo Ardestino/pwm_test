@@ -5,6 +5,7 @@
 #include <string>
 #include <sstream>
 #include <memory>
+#include <cstring>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -16,6 +17,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
+#include "wifi_config.h"
 
 constexpr int MOTOR_COUNT = 3;
 constexpr uint32_t MCPWM_RES_HZ = 1000000; // 1 MHz resolución
@@ -27,6 +29,8 @@ constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {0, 0, 0};         // L�
 constexpr std::array<int32_t, MOTOR_COUNT> MAX_LIMITS = {3200, 2100, 700}; // Límites máximos
 
 constexpr const char *TAG = "SYNC_TIMERS_CPP";
+
+static int s_retry_num = 0;
 
 // Estructura para comandos
 struct Command
@@ -46,11 +50,91 @@ struct Command
     Type type;
     std::array<int32_t, MOTOR_COUNT> params = {0, 0, 0};
     float duration = 1.0f;
-    std::string response;
+
+    // Constructor por defecto
+    Command() : type(MOVE), duration(1.0f) {}
+
+    // Constructor de copia
+    Command(const Command &other)
+        : type(other.type), params(other.params), duration(other.duration) {}
+
+    // Operador de asignación
+    Command &operator=(const Command &other)
+    {
+        if (this != &other)
+        {
+            type = other.type;
+            params = other.params;
+            duration = other.duration;
+        }
+        return *this;
+    }
 };
 
 // Cola para comandos
 static QueueHandle_t command_queue = nullptr;
+
+// Event handler para WiFi
+static void event_handler(void *arg, esp_event_base_t event_base,
+                          int32_t event_id, void *event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        esp_wifi_connect();
+    }
+    else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        if (s_retry_num < WIFI_MAXIMUM_RETRY)
+        {
+            esp_wifi_connect();
+            s_retry_num++;
+            ESP_LOGI(TAG, "retry to connect to the AP");
+        }
+        ESP_LOGI(TAG, "connect to the AP fail");
+    }
+    else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        ESP_LOGI(TAG, "got ip:" IPSTR, IP2STR(&event->ip_info.ip));
+        s_retry_num = 0;
+    }
+}
+
+void wifi_init_sta(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                        ESP_EVENT_ANY_ID,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &event_handler,
+                                                        NULL,
+                                                        &instance_got_ip));
+
+    wifi_config_t wifi_config = {};
+    strcpy((char *)wifi_config.sta.ssid, WIFI_SSID);
+    strcpy((char *)wifi_config.sta.password, WIFI_PASS);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "wifi_init_sta finished.");
+}
 
 // Forward declaration para evitar dependencias circulares
 class SynchronizedMotorSystem;
@@ -118,6 +202,9 @@ public:
 private:
     bool parse_command(const std::string &input, Command &cmd)
     {
+        // Limpiar el comando
+        cmd = Command(); // Reset al estado por defecto
+
         std::istringstream iss(input);
         std::string command;
         iss >> command;
@@ -179,7 +266,7 @@ class WebInterface : public CommunicationInterface
 {
 private:
     httpd_handle_t server = nullptr;
-    std::string last_response;
+    char last_response[512] = "System Ready"; // Buffer estático para evitar problemas de memoria
 
     static esp_err_t command_handler(httpd_req_t *req)
     {
@@ -191,21 +278,39 @@ private:
         {
             if (ret == HTTPD_SOCK_ERR_TIMEOUT)
             {
+                ESP_LOGW(TAG, "HTTP timeout en command_handler");
                 httpd_resp_send_408(req);
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Error HTTP en command_handler: %d", ret);
+                httpd_resp_send_500(req);
             }
             return ESP_FAIL;
         }
         buf[ret] = '\0';
 
+        ESP_LOGI(TAG, "HTTP Command received: %s", buf);
+
         Command cmd;
         if (self->parse_web_command(std::string(buf), cmd))
         {
             xQueueSend(command_queue, &cmd, 0);
-            httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"Command received\"}",
-                            HTTPD_RESP_USE_STRLEN);
+
+            // Crear respuesta JSON usando buffer estático
+            char json_response[512];
+            snprintf(json_response, sizeof(json_response),
+                     "{\"status\":\"ok\",\"message\":\"Command sent: %.100s\"}", buf);
+
+            // Configurar headers para CORS y evitar problemas de cache
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+            httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+            httpd_resp_send(req, json_response, HTTPD_RESP_USE_STRLEN);
         }
         else
         {
+            ESP_LOGW(TAG, "Invalid command: %s", buf);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid command");
         }
 
@@ -215,8 +320,16 @@ private:
     static esp_err_t status_handler(httpd_req_t *req)
     {
         WebInterface *self = static_cast<WebInterface *>(req->user_ctx);
+
+        // Crear respuesta JSON usando buffer estático
+        char json_response[512];
+        snprintf(json_response, sizeof(json_response),
+                 "{\"status\":\"ok\",\"last_response\":\"%.300s\"}", self->last_response);
+
         httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, self->last_response.c_str(), HTTPD_RESP_USE_STRLEN);
+        httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        httpd_resp_send(req, json_response, HTTPD_RESP_USE_STRLEN);
         return ESP_OK;
     }
 
@@ -224,27 +337,81 @@ private:
     {
         static const char html_page[] =
             "<!DOCTYPE html>\n"
-            "<html><head><title>Motor Control</title></head><body>\n"
-            "<h1>Motor Control</h1>\n"
-            "<div>Motor 1: <input type=\"number\" id=\"m1\" value=\"0\"></div>\n"
-            "<div>Motor 2: <input type=\"number\" id=\"m2\" value=\"0\"></div>\n"
-            "<div>Motor 3: <input type=\"number\" id=\"m3\" value=\"0\"></div>\n"
-            "<div>Duration: <input type=\"number\" id=\"dur\" value=\"1\" step=\"0.1\">s</div>\n"
-            "<div><button onclick=\"sendMove()\">Move</button></div>\n"
-            "<div><button onclick=\"getPos()\">Position</button></div>\n"
-            "<div id=\"status\">Ready</div>\n"
+            "<html><head>\n"
+            "<title>Robot Motor Control</title>\n"
+            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "<style>\n"
+            "body{font-family:Arial;margin:20px;background:#f0f0f0}\n"
+            ".container{max-width:600px;margin:auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}\n"
+            ".motor-group{margin:15px 0;padding:10px;border:1px solid #ddd;border-radius:5px}\n"
+            ".motor-row{display:flex;align-items:center;margin:5px 0}\n"
+            ".motor-row label{width:100px;display:inline-block}\n"
+            ".motor-row input{width:100px;margin:0 10px;padding:5px}\n"
+            "button{background:#007bff;color:white;border:none;padding:10px 20px;margin:5px;border-radius:5px;cursor:pointer}\n"
+            "button:hover{background:#0056b3}\n"
+            ".status{background:#e9ecef;padding:10px;margin:10px 0;border-radius:5px;font-family:monospace}\n"
+            ".limits{font-size:12px;color:#666}\n"
+            "</style>\n"
+            "</head><body>\n"
+            "<div class=\"container\">\n"
+            "<h1>🤖 Robot Motor Control</h1>\n"
+            "<div class=\"motor-group\">\n"
+            "<h3>Movimiento Relativo</h3>\n"
+            "<div class=\"motor-row\"><label>Motor 1:</label><input type=\"number\" id=\"m1\" value=\"0\"><span class=\"limits\">[0-3200]</span></div>\n"
+            "<div class=\"motor-row\"><label>Motor 2:</label><input type=\"number\" id=\"m2\" value=\"0\"><span class=\"limits\">[0-2100]</span></div>\n"
+            "<div class=\"motor-row\"><label>Motor 3:</label><input type=\"number\" id=\"m3\" value=\"0\"><span class=\"limits\">[0-700]</span></div>\n"
+            "<div class=\"motor-row\"><label>Duración:</label><input type=\"number\" id=\"dur\" value=\"1\" step=\"0.1\">s</div>\n"
+            "<button onclick=\"sendMove()\">Mover Relativo</button>\n"
+            "</div>\n"
+            "<div class=\"motor-group\">\n"
+            "<h3>Movimiento Absoluto</h3>\n"
+            "<div class=\"motor-row\"><label>Pos X:</label><input type=\"number\" id=\"x1\" value=\"0\"></div>\n"
+            "<div class=\"motor-row\"><label>Pos Y:</label><input type=\"number\" id=\"y1\" value=\"0\"></div>\n"
+            "<div class=\"motor-row\"><label>Pos Z:</label><input type=\"number\" id=\"z1\" value=\"0\"></div>\n"
+            "<div class=\"motor-row\"><label>Duración:</label><input type=\"number\" id=\"dur2\" value=\"2\" step=\"0.1\">s</div>\n"
+            "<button onclick=\"sendMoveTo()\">Ir a Posición</button>\n"
+            "</div>\n"
+            "<div class=\"motor-group\">\n"
+            "<h3>Control</h3>\n"
+            "<button onclick=\"getPos()\">📍 Posición</button>\n"
+            "<button onclick=\"getStatus()\">📊 Estado</button>\n"
+            "<button onclick=\"resetPos()\">🔄 Reset</button>\n"
+            "<button onclick=\"getLimits()\">📏 Límites</button>\n"
+            "<button onclick=\"emergencyStop()\" style=\"background:#dc3545\">🛑 STOP</button>\n"
+            "</div>\n"
+            "<div class=\"status\" id=\"status\">Sistema Listo</div>\n"
+            "</div>\n"
             "<script>\n"
+            "function updateStatus(msg){document.getElementById('status').innerHTML=msg;}\n"
+            "function sendCommand(cmd){\n"
+            "updateStatus('Enviando: '+cmd);\n"
+            "fetch('/api/command',{method:'POST',headers:{'Content-Type':'text/plain'},body:cmd})\n"
+            ".then(r=>r.json()).then(data=>{\n"
+            "if(data.status==='ok')updateStatus('✓ '+data.message);\n"
+            "else updateStatus('✗ Error: '+data.message);\n"
+            "setTimeout(getStatus,500);\n"
+            "}).catch(e=>updateStatus('✗ Error de conexión: '+e));}\n"
+            "function getStatus(){\n"
+            "fetch('/api/status').then(r=>r.json()).then(data=>{\n"
+            "if(data.last_response)updateStatus('Estado: '+data.last_response);\n"
+            "}).catch(e=>console.log('Error getting status:',e));}\n"
             "function sendMove(){\n"
             "var m1=document.getElementById('m1').value;\n"
             "var m2=document.getElementById('m2').value;\n"
             "var m3=document.getElementById('m3').value;\n"
             "var dur=document.getElementById('dur').value;\n"
-            "var cmd='MOVE '+m1+' '+m2+' '+m3+' '+dur;\n"
-            "fetch('/command',{method:'POST',body:cmd});\n"
-            "}\n"
-            "function getPos(){\n"
-            "fetch('/command',{method:'POST',body:'POS'});\n"
-            "}\n"
+            "sendCommand('MOVE '+m1+' '+m2+' '+m3+' '+dur);}\n"
+            "function sendMoveTo(){\n"
+            "var x=document.getElementById('x1').value;\n"
+            "var y=document.getElementById('y1').value;\n"
+            "var z=document.getElementById('z1').value;\n"
+            "var dur=document.getElementById('dur2').value;\n"
+            "sendCommand('MOVETO '+x+' '+y+' '+z+' '+dur);}\n"
+            "function getPos(){sendCommand('POS');}\n"
+            "function resetPos(){sendCommand('RESET');}\n"
+            "function getLimits(){sendCommand('LIMITS');}\n"
+            "function emergencyStop(){sendCommand('STOP');}\n"
+            "window.onload=function(){getStatus();setInterval(getStatus,10000);}\n"
             "</script>\n"
             "</body></html>";
 
@@ -257,6 +424,13 @@ public:
     {
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.server_port = 80;
+        config.max_open_sockets = 7;
+        config.max_uri_handlers = 8;
+        config.max_resp_headers = 8;
+        config.backlog_conn = 5;
+        config.lru_purge_enable = true;
+        config.recv_wait_timeout = 10; // 10 segundos timeout
+        config.send_wait_timeout = 10; // 10 segundos timeout
 
         if (httpd_start(&server, &config) == ESP_OK)
         {
@@ -268,30 +442,37 @@ public:
                 .user_ctx = this};
             httpd_register_uri_handler(server, &root_uri);
 
-            // Handler para comandos
+            // API REST para comandos
             httpd_uri_t command_uri = {
-                .uri = "/command",
+                .uri = "/api/command",
                 .method = HTTP_POST,
                 .handler = command_handler,
                 .user_ctx = this};
             httpd_register_uri_handler(server, &command_uri);
 
-            // Handler para status
+            // API REST para status
             httpd_uri_t status_uri = {
-                .uri = "/status",
+                .uri = "/api/status",
                 .method = HTTP_GET,
                 .handler = status_handler,
                 .user_ctx = this};
             httpd_register_uri_handler(server, &status_uri);
 
             ESP_LOGI(TAG, "Web interface started on port 80");
+            ESP_LOGI(TAG, "Access control panel at: http://[ESP32_IP]/");
+        }
+        else
+        {
+            ESP_LOGE(TAG, "Error starting HTTP server");
         }
     }
 
     void send_response(const std::string &response) override
     {
-        last_response = response;
-        ESP_LOGI(TAG, "Web Response: %s", response.c_str());
+        // Copiar la respuesta al buffer estático
+        strncpy(last_response, response.c_str(), sizeof(last_response) - 1);
+        last_response[sizeof(last_response) - 1] = '\0'; // Asegurar terminación null
+        ESP_LOGI(TAG, "Web Response: %s", last_response);
     }
 
     bool receive_command(Command &cmd) override
@@ -309,6 +490,9 @@ public:
 private:
     bool parse_web_command(const std::string &input, Command &cmd)
     {
+        // Limpiar el comando
+        cmd = Command(); // Reset al estado por defecto
+
         std::istringstream iss(input);
         std::string command;
         iss >> command;
@@ -338,6 +522,12 @@ private:
             cmd.type = Command::RESET_POSITION;
             return true;
         }
+        else if (command == "SETPOS")
+        {
+            cmd.type = Command::SET_POSITION;
+            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2];
+            return true;
+        }
         else if (command == "LIMITS")
         {
             cmd.type = Command::GET_LIMITS;
@@ -346,6 +536,11 @@ private:
         else if (command == "STOP")
         {
             cmd.type = Command::STOP;
+            return true;
+        }
+        else if (command == "STATUS")
+        {
+            cmd.type = Command::STATUS;
             return true;
         }
 
@@ -542,6 +737,9 @@ public:
     void set_direction(bool dir)
     {
         direction = dir;
+        // Log para debugging
+        ESP_LOGD(TAG, "Motor %d: Setting direction pin %d to %s (logic: %s)",
+                 motor_index, DIR_PINS[motor_index], dir ? "HIGH" : "LOW", dir ? "FORWARD" : "REVERSE");
         gpio_set_level(static_cast<gpio_num_t>(DIR_PINS[motor_index]), dir ? 1 : 0);
     }
 
@@ -617,6 +815,8 @@ public:
     void execute_synchronized_move(const std::array<int32_t, MOTOR_COUNT> &steps, float duration_sec)
     {
         ESP_LOGI(TAG, "== Iniciando movimiento sincronizado ==");
+        ESP_LOGI(TAG, "Pasos solicitados: [%ld, %ld, %ld], duración: %.2fs",
+                 steps[0], steps[1], steps[2], duration_sec);
 
         // Verificar si hay movimiento real
         bool has_movement = false;
@@ -636,6 +836,10 @@ public:
             robot_position.print_position();
             return;
         }
+
+        // Mostrar posición actual antes del movimiento
+        ESP_LOGI(TAG, "Posición antes del movimiento: [%ld, %ld, %ld]",
+                 robot_position.current_position[0], robot_position.current_position[1], robot_position.current_position[2]);
 
         // Verificar y ajustar movimiento según límites
         std::array<int32_t, MOTOR_COUNT> limited_steps = robot_position.get_limited_steps(steps);
@@ -669,8 +873,12 @@ public:
             {
                 motors[i].set_direction(direction);
                 float freq = static_cast<float>(abs_steps) / duration_sec;
-                ESP_LOGI(TAG, "Motor %d: %ld pasos (%s), %.2f Hz",
-                         i, limited_steps[i], direction ? "+" : "-", freq);
+
+                // Debug mejorado para verificar dirección
+                ESP_LOGI(TAG, "Motor %d: %ld pasos (%s), %.2f Hz, dir_pin=%s",
+                         i, limited_steps[i], direction ? "FORWARD(+)" : "REVERSE(-)", freq,
+                         direction ? "HIGH" : "LOW");
+
                 motors[i].setup(freq);
             }
             else
@@ -821,6 +1029,7 @@ public:
     {
         Command cmd;
 
+        // Procesar comandos de la cola
         if (xQueueReceive(command_queue, &cmd, 0) == pdTRUE)
         {
             std::string response = execute_command(cmd);
@@ -830,11 +1039,13 @@ public:
             }
         }
 
+        // Procesar comandos directos de interfaces (principalmente UART)
         for (auto &interface : interfaces)
         {
-            if (interface->receive_command(cmd))
+            Command direct_cmd;
+            if (interface->receive_command(direct_cmd))
             {
-                std::string response = execute_command(cmd);
+                std::string response = execute_command(direct_cmd);
                 interface->send_response(response);
             }
         }
@@ -938,8 +1149,11 @@ void planner_task(void *arg)
 
     // Agregar interfaces de comunicación
     processor.add_interface(std::make_unique<UARTInterface>());
-    // TODO: Configurar WiFi antes de habilitar interfaz Web
-    // processor.add_interface(std::make_unique<WebInterface>());
+
+    // Inicializar WiFi y agregar interfaz Web
+    wifi_init_sta();
+    vTaskDelay(pdMS_TO_TICKS(3000)); // Esperar conexión WiFi
+    processor.add_interface(std::make_unique<WebInterface>());
 
     // Crear tarea para procesamiento de comandos
     xTaskCreate(command_task, "commands", 8192, &processor, 5, nullptr);
@@ -957,7 +1171,7 @@ void planner_task(void *arg)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Interfaces available:");
     ESP_LOGI(TAG, "  - UART: 115200 baud on USB port");
-    ESP_LOGI(TAG, "  - Web: Disabled (configure WiFi to enable)");
+    ESP_LOGI(TAG, "  - Web: http://[ESP32_IP]/ (waiting for WiFi connection)");
 
     motor_system.print_current_position();
 
