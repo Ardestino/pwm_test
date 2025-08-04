@@ -26,8 +26,8 @@ constexpr std::array<int, MOTOR_COUNT> DIR_PINS = {26, 32, 21};
 constexpr std::array<int, MOTOR_COUNT> ENABLE_PINS = {14, 25, 18}; // Pines de habilitación para cada motor
 
 // Límites de movimiento para cada motor (en pasos)
-constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {0, 0, 0};         // Límites mínimos
-constexpr std::array<int32_t, MOTOR_COUNT> MAX_LIMITS = {3200, 2100, 700}; // Límites máximos
+constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {-1000000, -1000000, -1000000};         // Límites mínimos
+constexpr std::array<int32_t, MOTOR_COUNT> MAX_LIMITS = {100000, 100000, 100000}; // Límites máximos
 
 constexpr const char *TAG = "SYNC_TIMERS_CPP";
 
@@ -931,7 +931,6 @@ public:
             if (abs_steps > 0)
             {
                 motors[i].set_direction(direction);
-                motors[i].enable_motor(true); // Habilitar motor antes del movimiento
                 float freq = static_cast<float>(abs_steps) / duration_sec;
 
                 // Debug mejorado para verificar dirección
@@ -944,7 +943,6 @@ public:
             else
             {
                 ESP_LOGI(TAG, "Motor %d: Sin movimiento", i);
-                motors[i].disable_motor(); // Deshabilitar motor si no hay movimiento
             }
         }
 
@@ -1001,12 +999,6 @@ public:
         for (auto &motor : motors)
         {
             motor.cleanup();
-        }
-
-        // Deshabilitar todos los motores después del movimiento
-        for (int i = 0; i < MOTOR_COUNT; i++)
-        {
-            motors[i].disable_motor();
         }
 
         // Actualizar posición del robot
