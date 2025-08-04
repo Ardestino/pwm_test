@@ -2,11 +2,20 @@
 #include <vector>
 #include <array>
 #include <cmath>
+#include <string>
+#include <sstream>
+#include <memory>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/mcpwm_prelude.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_http_server.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
 
 constexpr int MOTOR_COUNT = 3;
 constexpr uint32_t MCPWM_RES_HZ = 1000000; // 1 MHz resolución
@@ -14,10 +23,335 @@ constexpr std::array<int, MOTOR_COUNT> STEP_PINS = {27, 33, 19};
 constexpr std::array<int, MOTOR_COUNT> DIR_PINS = {26, 32, 21};
 
 // Límites de movimiento para cada motor (en pasos)
-constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {0, 0, 0}; // Límites mínimos
+constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {0, 0, 0};         // Límites mínimos
 constexpr std::array<int32_t, MOTOR_COUNT> MAX_LIMITS = {3200, 2100, 700}; // Límites máximos
 
 constexpr const char *TAG = "SYNC_TIMERS_CPP";
+
+// Estructura para comandos
+struct Command
+{
+    enum Type
+    {
+        MOVE,
+        MOVE_TO,
+        GET_POSITION,
+        RESET_POSITION,
+        SET_POSITION,
+        GET_LIMITS,
+        STOP,
+        STATUS
+    };
+
+    Type type;
+    std::array<int32_t, MOTOR_COUNT> params = {0, 0, 0};
+    float duration = 1.0f;
+    std::string response;
+};
+
+// Cola para comandos
+static QueueHandle_t command_queue = nullptr;
+
+// Forward declaration para evitar dependencias circulares
+class SynchronizedMotorSystem;
+
+// Clase base abstracta para interfaces de comunicación
+class CommunicationInterface
+{
+public:
+    virtual ~CommunicationInterface() = default;
+    virtual void send_response(const std::string &response) = 0;
+    virtual bool receive_command(Command &cmd) = 0;
+    virtual void init() = 0;
+    virtual const char *get_name() const = 0;
+};
+
+// Interfaz UART (Puerto Serie)
+class UARTInterface : public CommunicationInterface
+{
+private:
+    static constexpr uart_port_t UART_NUM = UART_NUM_0;
+    static constexpr int BUF_SIZE = 1024;
+    char rx_buffer[BUF_SIZE];
+
+public:
+    void init() override
+    {
+        uart_config_t uart_config = {};
+        uart_config.baud_rate = 115200;
+        uart_config.data_bits = UART_DATA_8_BITS;
+        uart_config.parity = UART_PARITY_DISABLE;
+        uart_config.stop_bits = UART_STOP_BITS_1;
+        uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+        uart_config.rx_flow_ctrl_thresh = 122;
+
+        ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
+        ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+        ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
+
+        ESP_LOGI(TAG, "UART interface initialized at 115200 baud");
+    }
+
+    void send_response(const std::string &response) override
+    {
+        std::string full_response = response + "\r\n";
+        uart_write_bytes(UART_NUM, full_response.c_str(), full_response.length());
+    }
+
+    bool receive_command(Command &cmd) override
+    {
+        int len = uart_read_bytes(UART_NUM, rx_buffer, BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0)
+        {
+            rx_buffer[len] = '\0';
+            return parse_command(std::string(rx_buffer), cmd);
+        }
+        return false;
+    }
+
+    const char *get_name() const override
+    {
+        return "UART";
+    }
+
+private:
+    bool parse_command(const std::string &input, Command &cmd)
+    {
+        std::istringstream iss(input);
+        std::string command;
+        iss >> command;
+
+        // Convertir a mayúsculas para facilitar comparación
+        for (auto &c : command)
+            c = std::toupper(c);
+
+        if (command == "MOVE")
+        {
+            cmd.type = Command::MOVE;
+            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2] >> cmd.duration;
+            return true;
+        }
+        else if (command == "MOVETO")
+        {
+            cmd.type = Command::MOVE_TO;
+            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2] >> cmd.duration;
+            return true;
+        }
+        else if (command == "POS" || command == "POSITION")
+        {
+            cmd.type = Command::GET_POSITION;
+            return true;
+        }
+        else if (command == "RESET")
+        {
+            cmd.type = Command::RESET_POSITION;
+            return true;
+        }
+        else if (command == "SETPOS")
+        {
+            cmd.type = Command::SET_POSITION;
+            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2];
+            return true;
+        }
+        else if (command == "LIMITS")
+        {
+            cmd.type = Command::GET_LIMITS;
+            return true;
+        }
+        else if (command == "STOP")
+        {
+            cmd.type = Command::STOP;
+            return true;
+        }
+        else if (command == "STATUS")
+        {
+            cmd.type = Command::STATUS;
+            return true;
+        }
+
+        return false;
+    }
+};
+
+// Interfaz Web HTTP
+class WebInterface : public CommunicationInterface
+{
+private:
+    httpd_handle_t server = nullptr;
+    std::string last_response;
+
+    static esp_err_t command_handler(httpd_req_t *req)
+    {
+        WebInterface *self = static_cast<WebInterface *>(req->user_ctx);
+
+        char buf[1000];
+        int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
+        if (ret <= 0)
+        {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT)
+            {
+                httpd_resp_send_408(req);
+            }
+            return ESP_FAIL;
+        }
+        buf[ret] = '\0';
+
+        Command cmd;
+        if (self->parse_web_command(std::string(buf), cmd))
+        {
+            xQueueSend(command_queue, &cmd, 0);
+            httpd_resp_send(req, "{\"status\":\"ok\",\"message\":\"Command received\"}",
+                            HTTPD_RESP_USE_STRLEN);
+        }
+        else
+        {
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid command");
+        }
+
+        return ESP_OK;
+    }
+
+    static esp_err_t status_handler(httpd_req_t *req)
+    {
+        WebInterface *self = static_cast<WebInterface *>(req->user_ctx);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_send(req, self->last_response.c_str(), HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+    static esp_err_t control_page_handler(httpd_req_t *req)
+    {
+        static const char html_page[] =
+            "<!DOCTYPE html>\n"
+            "<html><head><title>Motor Control</title></head><body>\n"
+            "<h1>Motor Control</h1>\n"
+            "<div>Motor 1: <input type=\"number\" id=\"m1\" value=\"0\"></div>\n"
+            "<div>Motor 2: <input type=\"number\" id=\"m2\" value=\"0\"></div>\n"
+            "<div>Motor 3: <input type=\"number\" id=\"m3\" value=\"0\"></div>\n"
+            "<div>Duration: <input type=\"number\" id=\"dur\" value=\"1\" step=\"0.1\">s</div>\n"
+            "<div><button onclick=\"sendMove()\">Move</button></div>\n"
+            "<div><button onclick=\"getPos()\">Position</button></div>\n"
+            "<div id=\"status\">Ready</div>\n"
+            "<script>\n"
+            "function sendMove(){\n"
+            "var m1=document.getElementById('m1').value;\n"
+            "var m2=document.getElementById('m2').value;\n"
+            "var m3=document.getElementById('m3').value;\n"
+            "var dur=document.getElementById('dur').value;\n"
+            "var cmd='MOVE '+m1+' '+m2+' '+m3+' '+dur;\n"
+            "fetch('/command',{method:'POST',body:cmd});\n"
+            "}\n"
+            "function getPos(){\n"
+            "fetch('/command',{method:'POST',body:'POS'});\n"
+            "}\n"
+            "</script>\n"
+            "</body></html>";
+
+        httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+        return ESP_OK;
+    }
+
+public:
+    void init() override
+    {
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.server_port = 80;
+
+        if (httpd_start(&server, &config) == ESP_OK)
+        {
+            // Página principal
+            httpd_uri_t root_uri = {
+                .uri = "/",
+                .method = HTTP_GET,
+                .handler = control_page_handler,
+                .user_ctx = this};
+            httpd_register_uri_handler(server, &root_uri);
+
+            // Handler para comandos
+            httpd_uri_t command_uri = {
+                .uri = "/command",
+                .method = HTTP_POST,
+                .handler = command_handler,
+                .user_ctx = this};
+            httpd_register_uri_handler(server, &command_uri);
+
+            // Handler para status
+            httpd_uri_t status_uri = {
+                .uri = "/status",
+                .method = HTTP_GET,
+                .handler = status_handler,
+                .user_ctx = this};
+            httpd_register_uri_handler(server, &status_uri);
+
+            ESP_LOGI(TAG, "Web interface started on port 80");
+        }
+    }
+
+    void send_response(const std::string &response) override
+    {
+        last_response = response;
+        ESP_LOGI(TAG, "Web Response: %s", response.c_str());
+    }
+
+    bool receive_command(Command &cmd) override
+    {
+        // Para la interfaz web, los comandos llegan vía HTTP handlers
+        // Este método no se usa directamente
+        return false;
+    }
+
+    const char *get_name() const override
+    {
+        return "Web";
+    }
+
+private:
+    bool parse_web_command(const std::string &input, Command &cmd)
+    {
+        std::istringstream iss(input);
+        std::string command;
+        iss >> command;
+
+        for (auto &c : command)
+            c = std::toupper(c);
+
+        if (command == "MOVE")
+        {
+            cmd.type = Command::MOVE;
+            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2] >> cmd.duration;
+            return true;
+        }
+        else if (command == "MOVETO")
+        {
+            cmd.type = Command::MOVE_TO;
+            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2] >> cmd.duration;
+            return true;
+        }
+        else if (command == "POS")
+        {
+            cmd.type = Command::GET_POSITION;
+            return true;
+        }
+        else if (command == "RESET")
+        {
+            cmd.type = Command::RESET_POSITION;
+            return true;
+        }
+        else if (command == "LIMITS")
+        {
+            cmd.type = Command::GET_LIMITS;
+            return true;
+        }
+        else if (command == "STOP")
+        {
+            cmd.type = Command::STOP;
+            return true;
+        }
+
+        return false;
+    }
+};
 
 // Estructura para definir un movimiento
 struct Movement
@@ -90,6 +424,11 @@ struct RobotPosition
     }
 };
 
+// Forward declaration del callback
+static bool motor_timer_callback(mcpwm_timer_handle_t timer,
+                                 const mcpwm_timer_event_data_t *edata,
+                                 void *user_ctx);
+
 // Clase para controlar un motor individual
 class MotorController
 {
@@ -113,22 +452,20 @@ public:
         cleanup();
     }
 
-    // Callback estático que redirige a la instancia
-    static bool IRAM_ATTR timer_callback(mcpwm_timer_handle_t timer,
-                                         const mcpwm_timer_event_data_t *edata,
-                                         void *user_ctx)
+    // Método para acceso del callback
+    void increment_step()
     {
-        MotorController *motor = static_cast<MotorController *>(user_ctx);
-        motor->step_count++;
-        if (motor->step_count >= motor->target_steps)
+        step_count++;
+        if (step_count >= target_steps)
         {
-            mcpwm_timer_start_stop(motor->timer, MCPWM_TIMER_STOP_EMPTY);
-            mcpwm_generator_set_force_level(motor->gen, 0, true);
-            motor->active = false;
-            return true; // Stop timer
+            mcpwm_timer_start_stop(timer, MCPWM_TIMER_STOP_EMPTY);
+            mcpwm_generator_set_force_level(gen, 0, true);
+            active = false;
         }
-        return false;
     }
+
+    uint32_t get_step_count() const { return step_count; }
+    uint32_t get_target_steps() const { return target_steps; }
 
     void setup(float frequency_hz)
     {
@@ -170,7 +507,7 @@ public:
 
         // Registrar callback del timer
         mcpwm_timer_event_callbacks_t cbs = {};
-        cbs.on_full = timer_callback;
+        cbs.on_full = motor_timer_callback;
         ESP_ERROR_CHECK(mcpwm_timer_register_event_callbacks(timer, &cbs, this));
     }
 
@@ -236,6 +573,16 @@ public:
         }
     }
 };
+
+// Implementación del callback global
+static bool IRAM_ATTR motor_timer_callback(mcpwm_timer_handle_t timer,
+                                           const mcpwm_timer_event_data_t *edata,
+                                           void *user_ctx)
+{
+    MotorController *motor = static_cast<MotorController *>(user_ctx);
+    motor->increment_step();
+    return (motor->get_step_count() >= motor->get_target_steps());
+}
 
 // Clase principal para el sistema de motores sincronizados
 class SynchronizedMotorSystem
@@ -413,53 +760,173 @@ public:
     }
 };
 
+// Procesador de comandos
+class CommandProcessor
+{
+private:
+    SynchronizedMotorSystem *motor_system;
+    std::vector<std::unique_ptr<CommunicationInterface>> interfaces;
+
+public:
+    CommandProcessor(SynchronizedMotorSystem *system) : motor_system(system)
+    {
+        command_queue = xQueueCreate(10, sizeof(Command));
+    }
+
+    void add_interface(std::unique_ptr<CommunicationInterface> interface)
+    {
+        interface->init();
+        interfaces.push_back(std::move(interface));
+        ESP_LOGI(TAG, "Added %s interface", interfaces.back()->get_name());
+    }
+
+    void process_commands()
+    {
+        Command cmd;
+
+        if (xQueueReceive(command_queue, &cmd, 0) == pdTRUE)
+        {
+            std::string response = execute_command(cmd);
+            for (auto &interface : interfaces)
+            {
+                interface->send_response(response);
+            }
+        }
+
+        for (auto &interface : interfaces)
+        {
+            if (interface->receive_command(cmd))
+            {
+                std::string response = execute_command(cmd);
+                interface->send_response(response);
+            }
+        }
+    }
+
+private:
+    std::string execute_command(const Command &cmd)
+    {
+        std::ostringstream response;
+
+        switch (cmd.type)
+        {
+        case Command::MOVE:
+            response << "Moving: [" << cmd.params[0] << "," << cmd.params[1]
+                     << "," << cmd.params[2] << "] t:" << cmd.duration << "s";
+            motor_system->execute_synchronized_move(cmd.params, cmd.duration);
+            break;
+        case Command::MOVE_TO:
+        {
+            auto current = motor_system->get_current_position();
+            std::array<int32_t, MOTOR_COUNT> relative_move;
+            for (int i = 0; i < MOTOR_COUNT; i++)
+            {
+                relative_move[i] = cmd.params[i] - current[i];
+            }
+            response << "MoveTo: [" << cmd.params[0] << "," << cmd.params[1] << "," << cmd.params[2] << "]";
+            motor_system->execute_synchronized_move(relative_move, cmd.duration);
+            break;
+        }
+        case Command::GET_POSITION:
+        {
+            auto pos = motor_system->get_current_position();
+            response << "Position: [" << pos[0] << "," << pos[1] << "," << pos[2] << "]";
+            break;
+        }
+        case Command::RESET_POSITION:
+            motor_system->reset_position();
+            response << "Position reset to [0,0,0]";
+            break;
+        case Command::SET_POSITION:
+            motor_system->set_position(cmd.params);
+            response << "Position set to [" << cmd.params[0] << "," << cmd.params[1] << "," << cmd.params[2] << "]";
+            break;
+        case Command::GET_LIMITS:
+            response << "Limits: M0[" << MIN_LIMITS[0] << "," << MAX_LIMITS[0] << "] M1[" << MIN_LIMITS[1] << "," << MAX_LIMITS[1] << "] M2[" << MIN_LIMITS[2] << "," << MAX_LIMITS[2] << "]";
+            break;
+        case Command::STOP:
+            response << "STOP command received";
+            break;
+        case Command::STATUS:
+        {
+            auto pos = motor_system->get_current_position();
+            response << "Status: OK, Pos: [" << pos[0] << "," << pos[1] << "," << pos[2] << "]";
+            break;
+        }
+        default:
+            response << "Unknown command";
+            break;
+        }
+
+        return response.str();
+    }
+};
+
+// Función de tarea para el procesamiento de comandos
+void command_task(void *arg)
+{
+    CommandProcessor *processor = static_cast<CommandProcessor *>(arg);
+
+    while (true)
+    {
+        processor->process_commands();
+        vTaskDelay(pdMS_TO_TICKS(50)); // 20Hz
+    }
+}
+
 // Función de tarea para el planificador
 void planner_task(void *arg)
 {
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(1000)); // Esperar inicialización
 
     // Crear sistema de motores sincronizados
     SynchronizedMotorSystem motor_system;
 
-    // Secuencia de movimientos usando inicialización moderna de C++
-    std::vector<Movement> sequence = {
-        Movement({0, 2100, 0}, 0.5f, 1000),     // Q2 Full positivo
-        Movement({0, 0, 700}, 0.5f, 1000),      // Q3 Full positivo
-        Movement({3200, 0, 0}, 0.5f, 1000),     // Q1 Full positivo
-        Movement({-1600, 0, -350}, 1.0f, 1000), // Q1 y Q3 hacia atrás
-        Movement({0, -1050, 0}, 0.5f, 1000),    // Q2 hacia atrás
-        Movement({-10000, 0, 0}, 1.0f, 1000),   // Movimiento que será limitado
-        Movement({10000, 0, 0}, 1.0f, 1000),   // Movimiento que será limitado
-    };
+    // Crear procesador de comandos
+    CommandProcessor processor(&motor_system);
 
-    ESP_LOGI(TAG, "Iniciando sistema con límites de seguridad");
+    // Agregar interfaces de comunicación
+    processor.add_interface(std::make_unique<UARTInterface>());
+    // TODO: Configurar WiFi antes de habilitar interfaz Web
+    // processor.add_interface(std::make_unique<WebInterface>());
+
+    // Crear tarea para procesamiento de comandos
+    xTaskCreate(command_task, "commands", 8192, &processor, 5, nullptr);
+
+    ESP_LOGI(TAG, "=== Robot Control System Ready ===");
+    ESP_LOGI(TAG, "Available commands:");
+    ESP_LOGI(TAG, "  MOVE x y z [duration] - Move relative steps");
+    ESP_LOGI(TAG, "  MOVETO x y z [duration] - Move to absolute position");
+    ESP_LOGI(TAG, "  POS - Get current position");
+    ESP_LOGI(TAG, "  RESET - Reset position to [0,0,0]");
+    ESP_LOGI(TAG, "  SETPOS x y z - Set current position");
+    ESP_LOGI(TAG, "  LIMITS - Get motor limits");
+    ESP_LOGI(TAG, "  STATUS - Get system status");
+    ESP_LOGI(TAG, "  STOP - Emergency stop");
+    ESP_LOGI(TAG, "");
+    ESP_LOGI(TAG, "Interfaces available:");
+    ESP_LOGI(TAG, "  - UART: 115200 baud on USB port");
+    ESP_LOGI(TAG, "  - Web: Disabled (configure WiFi to enable)");
+
     motor_system.print_current_position();
 
-    // Ejecutar secuencia
-    motor_system.execute_movement_sequence(sequence);
-
-    ESP_LOGI(TAG, "Secuencia completada. Posición final:");
-    motor_system.print_current_position();
-
-    // Ejemplo de verificación de movimiento
-    std::array<int32_t, 3> test_move = {1000, 1000, 1000};
-    if (motor_system.can_move_to(test_move))
-    {
-        ESP_LOGI(TAG, "El movimiento [1000, 1000, 1000] es válido");
-    }
-    else
-    {
-        ESP_LOGI(TAG, "El movimiento [1000, 1000, 1000] excede los límites");
-    }
-
-    // Mantener la tarea activa
+    // Mantener la tarea activa - el sistema ahora responde a comandos
     while (true)
     {
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 extern "C" void app_main(void)
 {
-    xTaskCreate(planner_task, "planner_cpp", 8192, nullptr, 5, nullptr);
+    // Inicializar NVS para WiFi (si se usa)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    xTaskCreate(planner_task, "planner_cpp", 16384, nullptr, 5, nullptr);
 }
