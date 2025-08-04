@@ -12,6 +12,11 @@ constexpr int MOTOR_COUNT = 3;
 constexpr uint32_t MCPWM_RES_HZ = 1000000; // 1 MHz resolución
 constexpr std::array<int, MOTOR_COUNT> STEP_PINS = {27, 33, 19};
 constexpr std::array<int, MOTOR_COUNT> DIR_PINS = {26, 32, 21};
+
+// Límites de movimiento para cada motor (en pasos)
+constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {0, 0, 0}; // Límites mínimos
+constexpr std::array<int32_t, MOTOR_COUNT> MAX_LIMITS = {3200, 2100, 700}; // Límites máximos
+
 constexpr const char *TAG = "SYNC_TIMERS_CPP";
 
 // Estructura para definir un movimiento
@@ -25,6 +30,66 @@ struct Movement
         : steps(s), duration_sec(d), delay_after_ms(delay) {}
 };
 
+// Estructura para rastrear la posición del robot
+struct RobotPosition
+{
+    std::array<int32_t, MOTOR_COUNT> current_position = {0, 0, 0}; // Posición actual de cada motor
+
+    void update_position(int motor_index, int32_t steps_moved)
+    {
+        current_position[motor_index] += steps_moved;
+    }
+
+    bool is_move_valid(const std::array<int32_t, MOTOR_COUNT> &target_steps) const
+    {
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            int32_t new_position = current_position[i] + target_steps[i];
+            if (new_position < MIN_LIMITS[i] || new_position > MAX_LIMITS[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::array<int32_t, MOTOR_COUNT> get_limited_steps(const std::array<int32_t, MOTOR_COUNT> &requested_steps) const
+    {
+        std::array<int32_t, MOTOR_COUNT> limited_steps = requested_steps;
+
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            int32_t new_position = current_position[i] + requested_steps[i];
+
+            if (new_position < MIN_LIMITS[i])
+            {
+                limited_steps[i] = MIN_LIMITS[i] - current_position[i];
+            }
+            else if (new_position > MAX_LIMITS[i])
+            {
+                limited_steps[i] = MAX_LIMITS[i] - current_position[i];
+            }
+        }
+        return limited_steps;
+    }
+
+    void print_position() const
+    {
+        ESP_LOGI(TAG, "Posición actual: [%ld, %ld, %ld]",
+                 current_position[0], current_position[1], current_position[2]);
+        ESP_LOGI(TAG, "Límites: Motor0[%ld,%ld] Motor1[%ld,%ld] Motor2[%ld,%ld]",
+                 MIN_LIMITS[0], MAX_LIMITS[0],
+                 MIN_LIMITS[1], MAX_LIMITS[1],
+                 MIN_LIMITS[2], MAX_LIMITS[2]);
+    }
+
+    void reset_position()
+    {
+        current_position.fill(0);
+        ESP_LOGI(TAG, "Posición reseteada a [0, 0, 0]");
+    }
+};
+
 // Clase para controlar un motor individual
 class MotorController
 {
@@ -35,6 +100,7 @@ private:
     mcpwm_cmpr_handle_t cmp = nullptr;
     uint32_t target_steps = 0;
     uint32_t step_count = 0;
+    int32_t actual_steps_to_move = 0; // Pasos reales que se van a mover (puede ser limitado)
     bool active = false;
     bool direction = true; // true = positivo, false = negativo
     int motor_index;
@@ -142,12 +208,15 @@ public:
         gpio_set_level(static_cast<gpio_num_t>(DIR_PINS[motor_index]), dir ? 1 : 0);
     }
 
-    void set_target_steps(uint32_t steps)
+    void set_target_steps(uint32_t steps, int32_t actual_steps)
     {
         target_steps = steps;
+        actual_steps_to_move = actual_steps;
         step_count = 0;
         active = steps > 0;
     }
+
+    int32_t get_actual_steps_moved() const { return actual_steps_to_move; }
 
     bool is_active() const { return active; }
 
@@ -173,11 +242,13 @@ class SynchronizedMotorSystem
 {
 private:
     std::array<MotorController, MOTOR_COUNT> motors;
+    RobotPosition robot_position; // Rastreador de posición del robot
 
 public:
     SynchronizedMotorSystem() : motors{MotorController(0), MotorController(1), MotorController(2)}
     {
         init_direction_pins();
+        robot_position.print_position();
     }
 
     void init_direction_pins()
@@ -200,20 +271,40 @@ public:
     {
         ESP_LOGI(TAG, "== Iniciando movimiento sincronizado ==");
 
+        // Verificar y ajustar movimiento según límites
+        std::array<int32_t, MOTOR_COUNT> limited_steps = robot_position.get_limited_steps(steps);
+
+        // Verificar si hubo limitaciones
+        bool was_limited = false;
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            if (limited_steps[i] != steps[i])
+            {
+                was_limited = true;
+                ESP_LOGW(TAG, "Motor %d limitado: solicitado=%ld, permitido=%ld",
+                         i, steps[i], limited_steps[i]);
+            }
+        }
+
+        if (was_limited)
+        {
+            ESP_LOGW(TAG, "Movimiento fue limitado por restricciones de posición");
+        }
+
         // Configurar cada motor
         for (int i = 0; i < MOTOR_COUNT; i++)
         {
-            bool direction = steps[i] >= 0;
-            uint32_t abs_steps = std::abs(steps[i]);
+            bool direction = limited_steps[i] >= 0;
+            uint32_t abs_steps = std::abs(limited_steps[i]);
 
-            motors[i].set_target_steps(abs_steps);
+            motors[i].set_target_steps(abs_steps, limited_steps[i]);
 
             if (abs_steps > 0)
             {
                 motors[i].set_direction(direction);
                 float freq = static_cast<float>(abs_steps) / duration_sec;
                 ESP_LOGI(TAG, "Motor %d: %ld pasos (%s), %.2f Hz",
-                         i, steps[i], direction ? "+" : "-", freq);
+                         i, limited_steps[i], direction ? "+" : "-", freq);
                 motors[i].setup(freq);
             }
             else
@@ -259,7 +350,14 @@ public:
             motor.cleanup();
         }
 
+        // Actualizar posición del robot
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            robot_position.update_position(i, motors[i].get_actual_steps_moved());
+        }
+
         ESP_LOGI(TAG, "== Movimiento finalizado ==");
+        robot_position.print_position();
     }
 
     void execute_movement_sequence(const std::vector<Movement> &movements)
@@ -285,6 +383,34 @@ public:
 
         ESP_LOGI(TAG, "=== Secuencia completada ===");
     }
+
+    // Métodos adicionales para gestión de posición
+    void reset_position()
+    {
+        robot_position.reset_position();
+    }
+
+    void print_current_position() const
+    {
+        robot_position.print_position();
+    }
+
+    void set_position(const std::array<int32_t, MOTOR_COUNT> &position)
+    {
+        robot_position.current_position = position;
+        ESP_LOGI(TAG, "Posición establecida manualmente a [%ld, %ld, %ld]",
+                 position[0], position[1], position[2]);
+    }
+
+    std::array<int32_t, MOTOR_COUNT> get_current_position() const
+    {
+        return robot_position.current_position;
+    }
+
+    bool can_move_to(const std::array<int32_t, MOTOR_COUNT> &target_steps) const
+    {
+        return robot_position.is_move_valid(target_steps);
+    }
 };
 
 // Función de tarea para el planificador
@@ -302,10 +428,29 @@ void planner_task(void *arg)
         Movement({3200, 0, 0}, 0.5f, 1000),     // Q1 Full positivo
         Movement({-1600, 0, -350}, 1.0f, 1000), // Q1 y Q3 hacia atrás
         Movement({0, -1050, 0}, 0.5f, 1000),    // Q2 hacia atrás
+        Movement({-10000, 0, 0}, 1.0f, 1000),   // Movimiento que será limitado
+        Movement({10000, 0, 0}, 1.0f, 1000),   // Movimiento que será limitado
     };
+
+    ESP_LOGI(TAG, "Iniciando sistema con límites de seguridad");
+    motor_system.print_current_position();
 
     // Ejecutar secuencia
     motor_system.execute_movement_sequence(sequence);
+
+    ESP_LOGI(TAG, "Secuencia completada. Posición final:");
+    motor_system.print_current_position();
+
+    // Ejemplo de verificación de movimiento
+    std::array<int32_t, 3> test_move = {1000, 1000, 1000};
+    if (motor_system.can_move_to(test_move))
+    {
+        ESP_LOGI(TAG, "El movimiento [1000, 1000, 1000] es válido");
+    }
+    else
+    {
+        ESP_LOGI(TAG, "El movimiento [1000, 1000, 1000] excede los límites");
+    }
 
     // Mantener la tarea activa
     while (true)
