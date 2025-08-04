@@ -23,6 +23,7 @@ constexpr int MOTOR_COUNT = 3;
 constexpr uint32_t MCPWM_RES_HZ = 1000000; // 1 MHz resolución
 constexpr std::array<int, MOTOR_COUNT> STEP_PINS = {27, 33, 19};
 constexpr std::array<int, MOTOR_COUNT> DIR_PINS = {26, 32, 21};
+constexpr std::array<int, MOTOR_COUNT> ENABLE_PINS = {14, 25, 18}; // Pines de habilitación para cada motor
 
 // Límites de movimiento para cada motor (en pasos)
 constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {0, 0, 0};         // Límites mínimos
@@ -44,7 +45,9 @@ struct Command
         SET_POSITION,
         GET_LIMITS,
         STOP,
-        STATUS
+        STATUS,
+        ENABLE_MOTORS,
+        DISABLE_MOTORS
     };
 
     Type type;
@@ -256,6 +259,16 @@ private:
             cmd.type = Command::STATUS;
             return true;
         }
+        else if (command == "ENABLE")
+        {
+            cmd.type = Command::ENABLE_MOTORS;
+            return true;
+        }
+        else if (command == "DISABLE")
+        {
+            cmd.type = Command::DISABLE_MOTORS;
+            return true;
+        }
 
         return false;
     }
@@ -378,6 +391,8 @@ private:
             "<button onclick=\"getStatus()\">Estado</button>\n"
             "<button onclick=\"resetPos()\">Reset</button>\n"
             "<button onclick=\"getLimits()\">Limites</button>\n"
+            "<button onclick=\"enableMotors()\" style=\"background:#28a745\">Habilitar Motores</button>\n"
+            "<button onclick=\"disableMotors()\" style=\"background:#6c757d\">Deshabilitar Motores</button>\n"
             "<button onclick=\"emergencyStop()\" style=\"background:#dc3545\">STOP</button>\n"
             "</div>\n"
             "<div class=\"status\" id=\"status\">Sistema Listo</div>\n"
@@ -411,6 +426,8 @@ private:
             "function getPos(){sendCommand('POS');}\n"
             "function resetPos(){sendCommand('RESET');}\n"
             "function getLimits(){sendCommand('LIMITS');}\n"
+            "function enableMotors(){sendCommand('ENABLE');}\n"
+            "function disableMotors(){sendCommand('DISABLE');}\n"
             "function emergencyStop(){sendCommand('STOP');}\n"
             "window.onload=function(){getStatus();setInterval(getStatus,10000);}\n"
             "</script>\n"
@@ -544,6 +561,16 @@ private:
         else if (command == "STATUS")
         {
             cmd.type = Command::STATUS;
+            return true;
+        }
+        else if (command == "ENABLE")
+        {
+            cmd.type = Command::ENABLE_MOTORS;
+            return true;
+        }
+        else if (command == "DISABLE")
+        {
+            cmd.type = Command::DISABLE_MOTORS;
             return true;
         }
 
@@ -746,6 +773,20 @@ public:
         gpio_set_level(static_cast<gpio_num_t>(DIR_PINS[motor_index]), dir ? 1 : 0);
     }
 
+    void enable_motor(bool enable = true)
+    {
+        // LOW para habilitar el motor (lógica invertida típica de drivers stepper)
+        gpio_set_level(static_cast<gpio_num_t>(ENABLE_PINS[motor_index]), enable ? 0 : 1);
+        ESP_LOGI(TAG, "Motor %d: %s (enable pin %d set to %s)",
+                 motor_index, enable ? "ENABLED" : "DISABLED", 
+                 ENABLE_PINS[motor_index], enable ? "LOW" : "HIGH");
+    }
+
+    void disable_motor()
+    {
+        enable_motor(false);
+    }
+
     void set_target_steps(uint32_t steps, int32_t actual_steps)
     {
         target_steps = steps;
@@ -795,12 +836,13 @@ private:
 public:
     SynchronizedMotorSystem() : motors{MotorController(0), MotorController(1), MotorController(2)}
     {
-        init_direction_pins();
+        init_gpio_pins();
         robot_position.print_position();
     }
 
-    void init_direction_pins()
+    void init_gpio_pins()
     {
+        // Configurar pines de dirección
         for (int i = 0; i < MOTOR_COUNT; i++)
         {
             gpio_config_t dir_conf = {};
@@ -812,7 +854,21 @@ public:
             ESP_ERROR_CHECK(gpio_config(&dir_conf));
             gpio_set_level(static_cast<gpio_num_t>(DIR_PINS[i]), 0); // Inicializar en LOW
         }
-        ESP_LOGI(TAG, "Pines de dirección inicializados");
+
+        // Configurar pines de habilitación
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            gpio_config_t enable_conf = {};
+            enable_conf.pin_bit_mask = (1ULL << ENABLE_PINS[i]);
+            enable_conf.mode = GPIO_MODE_OUTPUT;
+            enable_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+            enable_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+            enable_conf.intr_type = GPIO_INTR_DISABLE;
+            ESP_ERROR_CHECK(gpio_config(&enable_conf));
+            gpio_set_level(static_cast<gpio_num_t>(ENABLE_PINS[i]), 1); // Inicializar deshabilitado (HIGH)
+        }
+        
+        ESP_LOGI(TAG, "Pines de dirección y habilitación inicializados");
     }
 
     void execute_synchronized_move(const std::array<int32_t, MOTOR_COUNT> &steps, float duration_sec)
@@ -875,10 +931,11 @@ public:
             if (abs_steps > 0)
             {
                 motors[i].set_direction(direction);
+                motors[i].enable_motor(true); // Habilitar motor antes del movimiento
                 float freq = static_cast<float>(abs_steps) / duration_sec;
 
                 // Debug mejorado para verificar dirección
-                ESP_LOGI(TAG, "Motor %d: %ld pasos (%s), %.2f Hz, dir_pin=%s",
+                ESP_LOGI(TAG, "Motor %d: %ld pasos (%s), %.2f Hz, dir_pin=%s, ENABLED",
                          i, limited_steps[i], direction ? "FORWARD(+)" : "REVERSE(-)", freq,
                          direction ? "HIGH" : "LOW");
 
@@ -887,6 +944,7 @@ public:
             else
             {
                 ESP_LOGI(TAG, "Motor %d: Sin movimiento", i);
+                motors[i].disable_motor(); // Deshabilitar motor si no hay movimiento
             }
         }
 
@@ -943,6 +1001,12 @@ public:
         for (auto &motor : motors)
         {
             motor.cleanup();
+        }
+
+        // Deshabilitar todos los motores después del movimiento
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            motors[i].disable_motor();
         }
 
         // Actualizar posición del robot
@@ -1005,6 +1069,36 @@ public:
     bool can_move_to(const std::array<int32_t, MOTOR_COUNT> &target_steps) const
     {
         return robot_position.is_move_valid(target_steps);
+    }
+
+    void enable_all_motors()
+    {
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            motors[i].enable_motor(true);
+        }
+        ESP_LOGI(TAG, "Todos los motores habilitados");
+    }
+
+    void disable_all_motors()
+    {
+        for (int i = 0; i < MOTOR_COUNT; i++)
+        {
+            motors[i].disable_motor();
+        }
+        ESP_LOGI(TAG, "Todos los motores deshabilitados");
+    }
+
+    void enable_motor(int motor_index, bool enable = true)
+    {
+        if (motor_index >= 0 && motor_index < MOTOR_COUNT)
+        {
+            motors[motor_index].enable_motor(enable);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "Índice de motor inválido: %d", motor_index);
+        }
     }
 };
 
@@ -1118,6 +1212,14 @@ private:
             response << "Status: OK, Pos: [" << pos[0] << "," << pos[1] << "," << pos[2] << "]";
             break;
         }
+        case Command::ENABLE_MOTORS:
+            motor_system->enable_all_motors();
+            response << "All motors enabled";
+            break;
+        case Command::DISABLE_MOTORS:
+            motor_system->disable_all_motors();
+            response << "All motors disabled";
+            break;
         default:
             response << "Unknown command";
             break;
@@ -1171,6 +1273,8 @@ void planner_task(void *arg)
     ESP_LOGI(TAG, "  LIMITS - Get motor limits");
     ESP_LOGI(TAG, "  STATUS - Get system status");
     ESP_LOGI(TAG, "  STOP - Emergency stop");
+    ESP_LOGI(TAG, "  ENABLE - Enable all motors");
+    ESP_LOGI(TAG, "  DISABLE - Disable all motors");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Interfaces available:");
     ESP_LOGI(TAG, "  - UART: 115200 baud on USB port");
