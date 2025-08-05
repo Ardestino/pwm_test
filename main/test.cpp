@@ -17,6 +17,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
+#include "esp_system.h"
 #include "wifi_config.h"
 
 constexpr int MOTOR_COUNT = 3;
@@ -50,7 +51,8 @@ struct Command
         ENABLE_MOTORS,
         DISABLE_MOTORS,
         SPINDLE_ON,
-        SPINDLE_OFF
+        SPINDLE_OFF,
+        RESTART
     };
 
     Type type;
@@ -282,6 +284,11 @@ private:
             cmd.type = Command::SPINDLE_OFF;
             return true;
         }
+        else if (command == "RESTART" || command == "REBOOT")
+        {
+            cmd.type = Command::RESTART;
+            return true;
+        }
 
         return false;
     }
@@ -407,6 +414,7 @@ private:
             "<button onclick=\"enableMotors()\" style=\"background:#28a745\">Habilitar Motores</button>\n"
             "<button onclick=\"disableMotors()\" style=\"background:#6c757d\">Deshabilitar Motores</button>\n"
             "<button onclick=\"emergencyStop()\" style=\"background:#dc3545\">STOP</button>\n"
+            "<button onclick=\"restartESP32()\" style=\"background:#ff6b35\">REINICIAR ESP32</button>\n"
             "</div>\n"
             "<div class=\"motor-group\">\n"
             "<h3>Control de Spindle</h3>\n"
@@ -449,6 +457,7 @@ private:
             "function emergencyStop(){sendCommand('STOP');}\n"
             "function spindleOn(){sendCommand('SPINDLE_ON');}\n"
             "function spindleOff(){sendCommand('SPINDLE_OFF');}\n"
+            "function restartESP32(){if(confirm('¿Estás seguro de que quieres reiniciar la ESP32?')){sendCommand('RESTART');}}\n"
             "window.onload=function(){getStatus();setInterval(getStatus,10000);}\n"
             "</script>\n"
             "</body></html>";
@@ -601,6 +610,11 @@ private:
         else if (command == "SPINDLE_OFF" || command == "SPINDLEOFF")
         {
             cmd.type = Command::SPINDLE_OFF;
+            return true;
+        }
+        else if (command == "RESTART" || command == "REBOOT")
+        {
+            cmd.type = Command::RESTART;
             return true;
         }
 
@@ -1272,6 +1286,12 @@ private:
             motor_system->spindle_off();
             response << "Spindle OFF";
             break;
+        case Command::RESTART:
+            response << "Restarting ESP32...";
+            // Esperar un momento para enviar la respuesta antes de reiniciar
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_restart();
+            break;
         default:
             response << "Unknown command";
             break;
@@ -1329,6 +1349,7 @@ void planner_task(void *arg)
     ESP_LOGI(TAG, "  DISABLE - Disable all motors");
     ESP_LOGI(TAG, "  SPINDLE_ON - Turn spindle on");
     ESP_LOGI(TAG, "  SPINDLE_OFF - Turn spindle off");
+    ESP_LOGI(TAG, "  RESTART - Restart ESP32");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Interfaces available:");
     ESP_LOGI(TAG, "  - UART: 115200 baud on USB port");
