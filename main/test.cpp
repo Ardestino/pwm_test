@@ -24,6 +24,7 @@ constexpr uint32_t MCPWM_RES_HZ = 1000000; // 1 MHz resolución
 constexpr std::array<int, MOTOR_COUNT> STEP_PINS = {27, 33, 19};
 constexpr std::array<int, MOTOR_COUNT> DIR_PINS = {26, 32, 21};
 constexpr std::array<int, MOTOR_COUNT> ENABLE_PINS = {14, 25, 18}; // Pines de habilitación para cada motor
+constexpr int SPINDLE_PIN = 13; // Pin para controlar el spindle
 
 // Límites de movimiento para cada motor (en pasos)
 constexpr std::array<int32_t, MOTOR_COUNT> MIN_LIMITS = {-1000000, -1000000, -1000000};         // Límites mínimos
@@ -47,7 +48,9 @@ struct Command
         STOP,
         STATUS,
         ENABLE_MOTORS,
-        DISABLE_MOTORS
+        DISABLE_MOTORS,
+        SPINDLE_ON,
+        SPINDLE_OFF
     };
 
     Type type;
@@ -269,6 +272,16 @@ private:
             cmd.type = Command::DISABLE_MOTORS;
             return true;
         }
+        else if (command == "SPINDLE_ON" || command == "SPINDLEON")
+        {
+            cmd.type = Command::SPINDLE_ON;
+            return true;
+        }
+        else if (command == "SPINDLE_OFF" || command == "SPINDLEOFF")
+        {
+            cmd.type = Command::SPINDLE_OFF;
+            return true;
+        }
 
         return false;
     }
@@ -395,6 +408,11 @@ private:
             "<button onclick=\"disableMotors()\" style=\"background:#6c757d\">Deshabilitar Motores</button>\n"
             "<button onclick=\"emergencyStop()\" style=\"background:#dc3545\">STOP</button>\n"
             "</div>\n"
+            "<div class=\"motor-group\">\n"
+            "<h3>Control de Spindle</h3>\n"
+            "<button onclick=\"spindleOn()\" style=\"background:#ffc107;color:#000\">Spindle ON</button>\n"
+            "<button onclick=\"spindleOff()\" style=\"background:#6c757d\">Spindle OFF</button>\n"
+            "</div>\n"
             "<div class=\"status\" id=\"status\">Sistema Listo</div>\n"
             "</div>\n"
             "<script>\n"
@@ -429,6 +447,8 @@ private:
             "function enableMotors(){sendCommand('ENABLE');}\n"
             "function disableMotors(){sendCommand('DISABLE');}\n"
             "function emergencyStop(){sendCommand('STOP');}\n"
+            "function spindleOn(){sendCommand('SPINDLE_ON');}\n"
+            "function spindleOff(){sendCommand('SPINDLE_OFF');}\n"
             "window.onload=function(){getStatus();setInterval(getStatus,10000);}\n"
             "</script>\n"
             "</body></html>";
@@ -571,6 +591,16 @@ private:
         else if (command == "DISABLE")
         {
             cmd.type = Command::DISABLE_MOTORS;
+            return true;
+        }
+        else if (command == "SPINDLE_ON" || command == "SPINDLEON")
+        {
+            cmd.type = Command::SPINDLE_ON;
+            return true;
+        }
+        else if (command == "SPINDLE_OFF" || command == "SPINDLEOFF")
+        {
+            cmd.type = Command::SPINDLE_OFF;
             return true;
         }
 
@@ -868,7 +898,17 @@ public:
             gpio_set_level(static_cast<gpio_num_t>(ENABLE_PINS[i]), 1); // Inicializar deshabilitado (HIGH)
         }
         
-        ESP_LOGI(TAG, "Pines de dirección y habilitación inicializados");
+        // Configurar pin del spindle
+        gpio_config_t spindle_conf = {};
+        spindle_conf.pin_bit_mask = (1ULL << SPINDLE_PIN);
+        spindle_conf.mode = GPIO_MODE_OUTPUT;
+        spindle_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        spindle_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        spindle_conf.intr_type = GPIO_INTR_DISABLE;
+        ESP_ERROR_CHECK(gpio_config(&spindle_conf));
+        gpio_set_level(static_cast<gpio_num_t>(SPINDLE_PIN), 0); // Inicializar apagado (LOW)
+        
+        ESP_LOGI(TAG, "Pines de dirección, habilitación y spindle inicializados");
     }
 
     void execute_synchronized_move(const std::array<int32_t, MOTOR_COUNT> &steps, float duration_sec)
@@ -1092,6 +1132,18 @@ public:
             ESP_LOGW(TAG, "Índice de motor inválido: %d", motor_index);
         }
     }
+
+    void spindle_on()
+    {
+        gpio_set_level(static_cast<gpio_num_t>(SPINDLE_PIN), 1);
+        ESP_LOGI(TAG, "Spindle encendido (pin %d = HIGH)", SPINDLE_PIN);
+    }
+
+    void spindle_off()
+    {
+        gpio_set_level(static_cast<gpio_num_t>(SPINDLE_PIN), 0);
+        ESP_LOGI(TAG, "Spindle apagado (pin %d = LOW)", SPINDLE_PIN);
+    }
 };
 
 // Procesador de comandos
@@ -1212,6 +1264,14 @@ private:
             motor_system->disable_all_motors();
             response << "All motors disabled";
             break;
+        case Command::SPINDLE_ON:
+            motor_system->spindle_on();
+            response << "Spindle ON";
+            break;
+        case Command::SPINDLE_OFF:
+            motor_system->spindle_off();
+            response << "Spindle OFF";
+            break;
         default:
             response << "Unknown command";
             break;
@@ -1267,6 +1327,8 @@ void planner_task(void *arg)
     ESP_LOGI(TAG, "  STOP - Emergency stop");
     ESP_LOGI(TAG, "  ENABLE - Enable all motors");
     ESP_LOGI(TAG, "  DISABLE - Disable all motors");
+    ESP_LOGI(TAG, "  SPINDLE_ON - Turn spindle on");
+    ESP_LOGI(TAG, "  SPINDLE_OFF - Turn spindle off");
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Interfaces available:");
     ESP_LOGI(TAG, "  - UART: 115200 baud on USB port");
