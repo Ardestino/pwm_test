@@ -20,7 +20,7 @@
 #include "esp_system.h"
 #include "esp_vfs.h"
 #include "esp_spiffs.h"
-#include "wifi_config.h"
+#include "config.h"
 
 constexpr int MOTOR_COUNT = 3;
 constexpr uint32_t MCPWM_RES_HZ = 1000000; // 1 MHz resolución
