@@ -18,6 +18,8 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "esp_system.h"
+#include "esp_vfs.h"
+#include "esp_spiffs.h"
 #include "wifi_config.h"
 
 constexpr int MOTOR_COUNT = 3;
@@ -142,6 +144,126 @@ void wifi_init_sta(void)
     ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "wifi_init_sta finished.");
+}
+
+// Función para inicializar SPIFFS
+esp_err_t init_spiffs(void)
+{
+    ESP_LOGI(TAG, "Initializing SPIFFS");
+
+    esp_vfs_spiffs_conf_t conf = {
+        .base_path = "/spiffs",
+        .partition_label = "www",
+        .max_files = 5,
+        .format_if_mount_failed = false
+    };
+
+    // Use settings defined above to initialize and mount SPIFFS filesystem.
+    esp_err_t ret = esp_vfs_spiffs_register(&conf);
+
+    if (ret != ESP_OK) {
+        if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount or format filesystem");
+        } else if (ret == ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "Failed to find SPIFFS partition");
+        } else {
+            ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        }
+        return ret;
+    }
+
+    size_t total = 0, used = 0;
+    ret = esp_spiffs_info("www", &total, &used);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "SPIFFS: %d kB total, %d kB used", total / 1024, used / 1024);
+    }
+
+    return ESP_OK;
+}
+
+// Función para obtener el tipo MIME basado en la extensión del archivo
+const char* get_mime_type(const char* filename) {
+    if (strstr(filename, ".html")) return "text/html";
+    if (strstr(filename, ".js")) return "application/javascript";
+    if (strstr(filename, ".css")) return "text/css";
+    if (strstr(filename, ".png")) return "image/png";
+    if (strstr(filename, ".jpg") || strstr(filename, ".jpeg")) return "image/jpeg";
+    if (strstr(filename, ".ico")) return "image/x-icon";
+    if (strstr(filename, ".svg")) return "image/svg+xml";
+    return "text/plain";
+}
+
+// Función para servir archivos estáticos desde SPIFFS
+esp_err_t serve_static_file(httpd_req_t *req, const char* filepath) {
+    // Validación básica de seguridad para evitar path traversal
+    if (strstr(filepath, "..") != NULL) {
+        ESP_LOGW(TAG, "Path traversal attempt blocked: %s", filepath);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    FILE* file = fopen(filepath, "r");
+    if (!file) {
+        ESP_LOGW(TAG, "File not found: %s", filepath);
+        httpd_resp_send_404(req);
+        return ESP_FAIL;
+    }
+
+    // Obtener tamaño del archivo
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (file_size <= 0) {
+        ESP_LOGE(TAG, "Invalid file size: %ld for file: %s", file_size, filepath);
+        fclose(file);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Verificar que el archivo no sea demasiado grande (limite de 1MB)
+    if (file_size > 1024 * 1024) {
+        ESP_LOGE(TAG, "File too large: %ld bytes for file: %s", file_size, filepath);
+        fclose(file);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    // Establecer tipo de contenido
+    const char* mime_type = get_mime_type(filepath);
+    httpd_resp_set_type(req, mime_type);
+    
+    // Añadir headers para UTF-8 si es HTML
+    if (strstr(mime_type, "text/html")) {
+        httpd_resp_set_hdr(req, "Content-Type", "text/html; charset=utf-8");
+    }
+    
+    // Añadir header de cache control
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=3600");
+
+    // Leer y enviar archivo en chunks
+    char buffer[1024];
+    size_t bytes_read;
+    esp_err_t send_result = ESP_OK;
+    
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        if (httpd_resp_send_chunk(req, buffer, bytes_read) != ESP_OK) {
+            ESP_LOGE(TAG, "Error sending file chunk for: %s", filepath);
+            send_result = ESP_FAIL;
+            break;
+        }
+    }
+    
+    // Finalizar respuesta solo si no hubo errores
+    if (send_result == ESP_OK) {
+        httpd_resp_send_chunk(req, NULL, 0);
+        ESP_LOGI(TAG, "Successfully served file: %s (%ld bytes)", filepath, file_size);
+    }
+    
+    fclose(file);
+    return send_result;
 }
 
 // Forward declaration para evitar dependencias circulares
@@ -368,104 +490,33 @@ private:
 
     static esp_err_t control_page_handler(httpd_req_t *req)
     {
-        static const char html_page[] =
-            "<!DOCTYPE html>\n"
-            "<html><head>\n"
-            "<meta charset=\"UTF-8\">\n"
-            "<title>Robot Motor Control</title>\n"
-            "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
-            "<style>\n"
-            "body{font-family:Arial;margin:20px;background:#f0f0f0}\n"
-            ".container{max-width:600px;margin:auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}\n"
-            ".motor-group{margin:15px 0;padding:10px;border:1px solid #ddd;border-radius:5px}\n"
-            ".motor-row{display:flex;align-items:center;margin:5px 0}\n"
-            ".motor-row label{width:100px;display:inline-block}\n"
-            ".motor-row input{width:100px;margin:0 10px;padding:5px}\n"
-            "button{background:#007bff;color:white;border:none;padding:10px 20px;margin:5px;border-radius:5px;cursor:pointer}\n"
-            "button:hover{background:#0056b3}\n"
-            ".status{background:#e9ecef;padding:10px;margin:10px 0;border-radius:5px;font-family:monospace}\n"
-            ".limits{font-size:12px;color:#666}\n"
-            "</style>\n"
-            "</head><body>\n"
-            "<div class=\"container\">\n"
-            "<h1>Robot Motor Control</h1>\n"
-            "<div class=\"motor-group\">\n"
-            "<h3>Movimiento Relativo</h3>\n"
-            "<div class=\"motor-row\"><label>Motor 1:</label><input type=\"number\" id=\"m1\" value=\"0\"><span class=\"limits\">[0-3200]</span></div>\n"
-            "<div class=\"motor-row\"><label>Motor 2:</label><input type=\"number\" id=\"m2\" value=\"0\"><span class=\"limits\">[0-2100]</span></div>\n"
-            "<div class=\"motor-row\"><label>Motor 3:</label><input type=\"number\" id=\"m3\" value=\"0\"><span class=\"limits\">[0-700]</span></div>\n"
-            "<div class=\"motor-row\"><label>Duracion:</label><input type=\"number\" id=\"dur\" value=\"1\" step=\"0.1\">s</div>\n"
-            "<button onclick=\"sendMove()\">Mover Relativo</button>\n"
-            "</div>\n"
-            "<div class=\"motor-group\">\n"
-            "<h3>Movimiento Absoluto</h3>\n"
-            "<div class=\"motor-row\"><label>Pos X:</label><input type=\"number\" id=\"x1\" value=\"0\"></div>\n"
-            "<div class=\"motor-row\"><label>Pos Y:</label><input type=\"number\" id=\"y1\" value=\"0\"></div>\n"
-            "<div class=\"motor-row\"><label>Pos Z:</label><input type=\"number\" id=\"z1\" value=\"0\"></div>\n"
-            "<div class=\"motor-row\"><label>Duracion:</label><input type=\"number\" id=\"dur2\" value=\"2\" step=\"0.1\">s</div>\n"
-            "<button onclick=\"sendMoveTo()\">Ir a Posicion</button>\n"
-            "</div>\n"
-            "<div class=\"motor-group\">\n"
-            "<h3>Control</h3>\n"
-            "<button onclick=\"getPos()\">Posicion</button>\n"
-            "<button onclick=\"getStatus()\">Estado</button>\n"
-            "<button onclick=\"resetPos()\">Reset</button>\n"
-            "<button onclick=\"getLimits()\">Limites</button>\n"
-            "<button onclick=\"enableMotors()\" style=\"background:#28a745\">Habilitar Motores</button>\n"
-            "<button onclick=\"disableMotors()\" style=\"background:#6c757d\">Deshabilitar Motores</button>\n"
-            "<button onclick=\"emergencyStop()\" style=\"background:#dc3545\">STOP</button>\n"
-            "<button onclick=\"restartESP32()\" style=\"background:#ff6b35\">REINICIAR ESP32</button>\n"
-            "</div>\n"
-            "<div class=\"motor-group\">\n"
-            "<h3>Control de Spindle</h3>\n"
-            "<button onclick=\"spindleOn()\" style=\"background:#ffc107;color:#000\">Spindle ON</button>\n"
-            "<button onclick=\"spindleOff()\" style=\"background:#6c757d\">Spindle OFF</button>\n"
-            "</div>\n"
-            "<div class=\"status\" id=\"status\">Sistema Listo</div>\n"
-            "</div>\n"
-            "<script>\n"
-            "function updateStatus(msg){document.getElementById('status').innerHTML=msg;}\n"
-            "function sendCommand(cmd){\n"
-            "updateStatus('Enviando: '+cmd);\n"
-            "fetch('/api/command',{method:'POST',headers:{'Content-Type':'text/plain'},body:cmd})\n"
-            ".then(r=>r.json()).then(data=>{\n"
-            "if(data.status==='ok')updateStatus('OK: '+data.message);\n"
-            "else updateStatus('Error: '+data.message);\n"
-            "setTimeout(getStatus,500);\n"
-            "}).catch(e=>updateStatus('Error de conexion: '+e));}\n"
-            "function getStatus(){\n"
-            "fetch('/api/status').then(r=>r.json()).then(data=>{\n"
-            "if(data.last_response)updateStatus('Estado: '+data.last_response);\n"
-            "}).catch(e=>console.log('Error getting status:',e));}\n"
-            "function sendMove(){\n"
-            "var m1=document.getElementById('m1').value;\n"
-            "var m2=document.getElementById('m2').value;\n"
-            "var m3=document.getElementById('m3').value;\n"
-            "var dur=document.getElementById('dur').value;\n"
-            "sendCommand('MOVE '+m1+' '+m2+' '+m3+' '+dur);}\n"
-            "function sendMoveTo(){\n"
-            "var x=document.getElementById('x1').value;\n"
-            "var y=document.getElementById('y1').value;\n"
-            "var z=document.getElementById('z1').value;\n"
-            "var dur=document.getElementById('dur2').value;\n"
-            "sendCommand('MOVETO '+x+' '+y+' '+z+' '+dur);}\n"
-            "function getPos(){sendCommand('POS');}\n"
-            "function resetPos(){sendCommand('RESET');}\n"
-            "function getLimits(){sendCommand('LIMITS');}\n"
-            "function enableMotors(){sendCommand('ENABLE');}\n"
-            "function disableMotors(){sendCommand('DISABLE');}\n"
-            "function emergencyStop(){sendCommand('STOP');}\n"
-            "function spindleOn(){sendCommand('SPINDLE_ON');}\n"
-            "function spindleOff(){sendCommand('SPINDLE_OFF');}\n"
-            "function restartESP32(){if(confirm('¿Estás seguro de que quieres reiniciar la ESP32?')){sendCommand('RESTART');}}\n"
-            "window.onload=function(){getStatus();setInterval(getStatus,10000);}\n"
-            "</script>\n"
-            "</body></html>";
+        // Servir index.html desde SPIFFS
+        return serve_static_file(req, "/spiffs/index.html");
+    }
 
-        // Configurar headers correctos para UTF-8
-        httpd_resp_set_type(req, "text/html; charset=utf-8");
-        httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
+    static esp_err_t static_file_handler(httpd_req_t *req)
+    {
+        // Construir ruta del archivo basada en la URI
+        char filepath[512]; // Aumentado a 512 bytes para evitar warnings
+        
+        // Validar que la URI no sea demasiado larga
+        size_t uri_len = strlen(req->uri);
+        if (uri_len > 500) { // Dejar espacio para "/spiffs" (7 chars) + null terminator
+            ESP_LOGW(TAG, "URI too long (%zu chars): %.50s...", uri_len, req->uri);
+            httpd_resp_send_404(req);
+            return ESP_FAIL;
+        }
+        
+        // Usar snprintf de forma segura
+        int result = snprintf(filepath, sizeof(filepath), "/spiffs%s", req->uri);
+        if (result >= (int)sizeof(filepath) || result < 0) {
+            ESP_LOGW(TAG, "Filepath too long for URI: %s", req->uri);
+            httpd_resp_send_404(req);
+            return ESP_FAIL;
+        }
+        
+        ESP_LOGI(TAG, "Serving static file: %s", filepath);
+        return serve_static_file(req, filepath);
     }
 
 public:
@@ -474,7 +525,7 @@ public:
         httpd_config_t config = HTTPD_DEFAULT_CONFIG();
         config.server_port = 80;
         config.max_open_sockets = 7;
-        config.max_uri_handlers = 8;
+        config.max_uri_handlers = 16; // Aumentado para archivos estáticos
         config.max_resp_headers = 8;
         config.backlog_conn = 5;
         config.lru_purge_enable = true;
@@ -483,15 +534,7 @@ public:
 
         if (httpd_start(&server, &config) == ESP_OK)
         {
-            // Página principal
-            httpd_uri_t root_uri = {
-                .uri = "/",
-                .method = HTTP_GET,
-                .handler = control_page_handler,
-                .user_ctx = this};
-            httpd_register_uri_handler(server, &root_uri);
-
-            // API REST para comandos
+            // API REST para comandos (debe registrarse antes del handler genérico)
             httpd_uri_t command_uri = {
                 .uri = "/api/command",
                 .method = HTTP_POST,
@@ -499,7 +542,7 @@ public:
                 .user_ctx = this};
             httpd_register_uri_handler(server, &command_uri);
 
-            // API REST para status
+            // API REST para status (debe registrarse antes del handler genérico)
             httpd_uri_t status_uri = {
                 .uri = "/api/status",
                 .method = HTTP_GET,
@@ -507,7 +550,33 @@ public:
                 .user_ctx = this};
             httpd_register_uri_handler(server, &status_uri);
 
+            // Página principal desde SPIFFS
+            httpd_uri_t root_uri = {
+                .uri = "/",
+                .method = HTTP_GET,
+                .handler = control_page_handler,
+                .user_ctx = this};
+            httpd_register_uri_handler(server, &root_uri);
+
+            // Página index.html desde SPIFFS
+            httpd_uri_t index_uri = {
+                .uri = "/index.html",
+                .method = HTTP_GET,
+                .handler = control_page_handler,
+                .user_ctx = this};
+            httpd_register_uri_handler(server, &index_uri);
+
+            // Handler genérico para archivos estáticos (debe registrarse al final)
+            // Este handler captura todo lo que no matchee con los anteriores
+            httpd_uri_t static_files_uri = {
+                .uri = "/*", // Wildcard para cualquier archivo
+                .method = HTTP_GET,
+                .handler = static_file_handler,
+                .user_ctx = this};
+            httpd_register_uri_handler(server, &static_files_uri);
+
             ESP_LOGI(TAG, "Web interface started on port 80");
+            ESP_LOGI(TAG, "Serving static files from SPIFFS partition 'www'");
             ESP_LOGI(TAG, "Access control panel at: http://[ESP32_IP]/");
         }
         else
@@ -1318,6 +1387,15 @@ void planner_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(1000)); // Esperar inicialización
 
+    // Inicializar SPIFFS
+    ESP_LOGI(TAG, "Initializing SPIFFS filesystem...");
+    esp_err_t ret = init_spiffs();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize SPIFFS, using embedded HTML as fallback");
+    } else {
+        ESP_LOGI(TAG, "SPIFFS initialized successfully");
+    }
+
     // Crear sistema de motores sincronizados
     SynchronizedMotorSystem motor_system;
 
@@ -1353,7 +1431,7 @@ void planner_task(void *arg)
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "Interfaces available:");
     ESP_LOGI(TAG, "  - UART: 115200 baud on USB port");
-    ESP_LOGI(TAG, "  - Web: http://[ESP32_IP]/ (waiting for WiFi connection)");
+    ESP_LOGI(TAG, "  - Web: http://[ESP32_IP]/ (serving from SPIFFS)");
 
     motor_system.print_current_position();
 
