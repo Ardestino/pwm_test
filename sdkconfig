@@ -407,13 +407,6 @@ CONFIG_PARTITION_TABLE_MD5=y
 # end of Partition Table
 
 #
-# Example Configuration
-#
-CONFIG_EXAMPLE_SYNC_FROM_GPIO=y
-# CONFIG_EXAMPLE_SYNC_FROM_TEZ is not set
-# end of Example Configuration
-
-#
 # Compiler options
 #
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=y
