@@ -862,6 +862,47 @@ private:
         gpio_set_level(static_cast<gpio_num_t>(pin), initial_level);
     }
 
+    // Función helper para esperar a que todos los motores terminen
+    bool wait_for_motors_completion(float duration_sec)
+    {
+        const uint32_t MAX_TIMEOUT = duration_sec * 1000 + 5000; // Duración + 5 segundos de margen
+        uint32_t timeout_counter = 0;
+
+        while (timeout_counter < MAX_TIMEOUT)
+        {
+            // Verificar si todos los motores han terminado
+            bool all_done = true;
+            for (const auto &motor : motors)
+            {
+                if (motor.is_active())
+                {
+                    all_done = false;
+                    break;
+                }
+            }
+
+            if (all_done)
+            {
+                return true; // Éxito: todos los motores terminaron
+            }
+
+            // Alimentar el watchdog y dar tiempo a otras tareas
+            vTaskDelay(pdMS_TO_TICKS(10));
+            timeout_counter += 10;
+        }
+
+        // Timeout alcanzado
+        ESP_LOGW(TAG, "Timeout en movimiento - forzando finalización");
+        for (auto &motor : motors)
+        {
+            if (motor.is_active())
+            {
+                motor.cleanup();
+            }
+        }
+        return false; // Timeout
+    }
+
 public:
     SynchronizedMotorSystem() : motors{MotorController(0), MotorController(1), MotorController(2)}
     {
@@ -979,39 +1020,8 @@ public:
             motor.start();
         }
 
-        // Esperar a que todos terminen
-        bool all_done = false;
-        uint32_t timeout_counter = 0;
-        const uint32_t MAX_TIMEOUT = duration_sec * 1000 + 5000; // Duración + 5 segundos de margen
-
-        while (!all_done && timeout_counter < MAX_TIMEOUT)
-        {
-            all_done = true;
-            for (const auto &motor : motors)
-            {
-                if (motor.is_active())
-                {
-                    all_done = false;
-                    break;
-                }
-            }
-
-            // Alimentar el watchdog y dar tiempo a otras tareas
-            vTaskDelay(pdMS_TO_TICKS(10)); // Aumentado de 1ms a 10ms
-            timeout_counter += 10;
-        }
-
-        if (timeout_counter >= MAX_TIMEOUT)
-        {
-            ESP_LOGW(TAG, "Timeout en movimiento - forzando finalización");
-            for (auto &motor : motors)
-            {
-                if (motor.is_active())
-                {
-                    motor.cleanup();
-                }
-            }
-        }
+        // Esperar a que todos terminen con timeout
+        wait_for_motors_completion(duration_sec);
 
         // Limpiar recursos después del movimiento
         for (auto &motor : motors)
