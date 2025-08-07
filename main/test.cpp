@@ -269,68 +269,11 @@ esp_err_t serve_static_file(httpd_req_t *req, const char* filepath) {
 // Forward declaration para evitar dependencias circulares
 class SynchronizedMotorSystem;
 
-// Clase base abstracta para interfaces de comunicación
-class CommunicationInterface
+// Clase utilitaria para parsing de comandos
+class CommandParser
 {
 public:
-    virtual ~CommunicationInterface() = default;
-    virtual void send_response(const std::string &response) = 0;
-    virtual bool receive_command(Command &cmd) = 0;
-    virtual void init() = 0;
-    virtual const char *get_name() const = 0;
-};
-
-// Interfaz UART (Puerto Serie)
-class UARTInterface : public CommunicationInterface
-{
-private:
-    static constexpr uart_port_t UART_NUM = UART_NUM_0;
-    static constexpr int BUF_SIZE = 1024;
-    char rx_buffer[BUF_SIZE];
-
-public:
-    void init() override
-    {
-        uart_config_t uart_config = {};
-        uart_config.baud_rate = 115200;
-        uart_config.data_bits = UART_DATA_8_BITS;
-        uart_config.parity = UART_PARITY_DISABLE;
-        uart_config.stop_bits = UART_STOP_BITS_1;
-        uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
-        uart_config.rx_flow_ctrl_thresh = 122;
-
-        ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
-        ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
-                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-        ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
-
-        ESP_LOGI(TAG, "UART interface initialized at 115200 baud");
-    }
-
-    void send_response(const std::string &response) override
-    {
-        std::string full_response = response + "\r\n";
-        uart_write_bytes(UART_NUM, full_response.c_str(), full_response.length());
-    }
-
-    bool receive_command(Command &cmd) override
-    {
-        int len = uart_read_bytes(UART_NUM, rx_buffer, BUF_SIZE - 1, pdMS_TO_TICKS(100));
-        if (len > 0)
-        {
-            rx_buffer[len] = '\0';
-            return parse_command(std::string(rx_buffer), cmd);
-        }
-        return false;
-    }
-
-    const char *get_name() const override
-    {
-        return "UART";
-    }
-
-private:
-    bool parse_command(const std::string &input, Command &cmd)
+    static bool parse_command(const std::string &input, Command &cmd)
     {
         // Limpiar el comando
         cmd = Command(); // Reset al estado por defecto
@@ -416,6 +359,67 @@ private:
     }
 };
 
+// Clase base abstracta para interfaces de comunicación
+class CommunicationInterface
+{
+public:
+    virtual ~CommunicationInterface() = default;
+    virtual void send_response(const std::string &response) = 0;
+    virtual bool receive_command(Command &cmd) = 0;
+    virtual void init() = 0;
+    virtual const char *get_name() const = 0;
+};
+
+// Interfaz UART (Puerto Serie)
+class UARTInterface : public CommunicationInterface
+{
+private:
+    static constexpr uart_port_t UART_NUM = UART_NUM_0;
+    static constexpr int BUF_SIZE = 1024;
+    char rx_buffer[BUF_SIZE];
+
+public:
+    void init() override
+    {
+        uart_config_t uart_config = {};
+        uart_config.baud_rate = 115200;
+        uart_config.data_bits = UART_DATA_8_BITS;
+        uart_config.parity = UART_PARITY_DISABLE;
+        uart_config.stop_bits = UART_STOP_BITS_1;
+        uart_config.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+        uart_config.rx_flow_ctrl_thresh = 122;
+
+        ESP_ERROR_CHECK(uart_param_config(UART_NUM, &uart_config));
+        ESP_ERROR_CHECK(uart_set_pin(UART_NUM, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE,
+                                     UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+        ESP_ERROR_CHECK(uart_driver_install(UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
+
+        ESP_LOGI(TAG, "UART interface initialized at 115200 baud");
+    }
+
+    void send_response(const std::string &response) override
+    {
+        std::string full_response = response + "\r\n";
+        uart_write_bytes(UART_NUM, full_response.c_str(), full_response.length());
+    }
+
+    bool receive_command(Command &cmd) override
+    {
+        int len = uart_read_bytes(UART_NUM, rx_buffer, BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        if (len > 0)
+        {
+            rx_buffer[len] = '\0';
+            return CommandParser::parse_command(std::string(rx_buffer), cmd);
+        }
+        return false;
+    }
+
+    const char *get_name() const override
+    {
+        return "UART";
+    }
+};
+
 // Interfaz Web HTTP
 class WebInterface : public CommunicationInterface
 {
@@ -425,8 +429,6 @@ private:
 
     static esp_err_t command_handler(httpd_req_t *req)
     {
-        WebInterface *self = static_cast<WebInterface *>(req->user_ctx);
-
         char buf[1000];
         int ret = httpd_req_recv(req, buf, sizeof(buf) - 1);
         if (ret <= 0)
@@ -448,7 +450,7 @@ private:
         ESP_LOGI(TAG, "HTTP Command received: %s", buf);
 
         Command cmd;
-        if (self->parse_web_command(std::string(buf), cmd))
+        if (CommandParser::parse_command(std::string(buf), cmd))
         {
             xQueueSend(command_queue, &cmd, 0);
 
@@ -603,91 +605,6 @@ public:
     const char *get_name() const override
     {
         return "Web";
-    }
-
-private:
-    bool parse_web_command(const std::string &input, Command &cmd)
-    {
-        // Limpiar el comando
-        cmd = Command(); // Reset al estado por defecto
-
-        std::istringstream iss(input);
-        std::string command;
-        iss >> command;
-
-        for (auto &c : command)
-            c = std::toupper(c);
-
-        if (command == "MOVE")
-        {
-            cmd.type = Command::MOVE;
-            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2] >> cmd.duration;
-            return true;
-        }
-        else if (command == "MOVETO")
-        {
-            cmd.type = Command::MOVE_TO;
-            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2] >> cmd.duration;
-            return true;
-        }
-        else if (command == "POS")
-        {
-            cmd.type = Command::GET_POSITION;
-            return true;
-        }
-        else if (command == "RESET")
-        {
-            cmd.type = Command::RESET_POSITION;
-            return true;
-        }
-        else if (command == "SETPOS")
-        {
-            cmd.type = Command::SET_POSITION;
-            iss >> cmd.params[0] >> cmd.params[1] >> cmd.params[2];
-            return true;
-        }
-        else if (command == "LIMITS")
-        {
-            cmd.type = Command::GET_LIMITS;
-            return true;
-        }
-        else if (command == "STOP")
-        {
-            cmd.type = Command::STOP;
-            return true;
-        }
-        else if (command == "STATUS")
-        {
-            cmd.type = Command::STATUS;
-            return true;
-        }
-        else if (command == "ENABLE")
-        {
-            cmd.type = Command::ENABLE_MOTORS;
-            return true;
-        }
-        else if (command == "DISABLE")
-        {
-            cmd.type = Command::DISABLE_MOTORS;
-            return true;
-        }
-        else if (command == "SPINDLE_ON" || command == "SPINDLEON")
-        {
-            cmd.type = Command::SPINDLE_ON;
-            return true;
-        }
-        else if (command == "SPINDLE_OFF" || command == "SPINDLEOFF")
-        {
-            cmd.type = Command::SPINDLE_OFF;
-            return true;
-        }
-        else if (command == "RESTART" || command == "REBOOT")
-        {
-            cmd.type = Command::RESTART;
-            return true;
-        }
-
-        return false;
     }
 };
 
