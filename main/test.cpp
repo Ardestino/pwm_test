@@ -57,28 +57,14 @@ struct Command
         RESTART
     };
 
-    Type type;
+    Type type = MOVE;
     std::array<int32_t, MOTOR_COUNT> params = {0, 0, 0};
     float duration = 1.0f;
 
-    // Constructor por defecto
-    Command() : type(MOVE), duration(1.0f) {}
-
-    // Constructor de copia
-    Command(const Command &other)
-        : type(other.type), params(other.params), duration(other.duration) {}
-
-    // Operador de asignación
-    Command &operator=(const Command &other)
-    {
-        if (this != &other)
-        {
-            type = other.type;
-            params = other.params;
-            duration = other.duration;
-        }
-        return *this;
-    }
+    // Usar constructores y operadores por defecto del compilador
+    Command() = default;
+    Command(const Command &) = default;
+    Command &operator=(const Command &) = default;
 };
 
 // Cola para comandos
