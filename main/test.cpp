@@ -863,6 +863,19 @@ private:
     std::array<MotorController, MOTOR_COUNT> motors;
     RobotPosition robot_position; // Rastreador de posición del robot
 
+    // Función helper para configurar pines GPIO
+    void configure_gpio_pin(int pin, gpio_mode_t mode, int initial_level)
+    {
+        gpio_config_t gpio_conf = {};
+        gpio_conf.pin_bit_mask = (1ULL << pin);
+        gpio_conf.mode = mode;
+        gpio_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        gpio_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+        gpio_conf.intr_type = GPIO_INTR_DISABLE;
+        ESP_ERROR_CHECK(gpio_config(&gpio_conf));
+        gpio_set_level(static_cast<gpio_num_t>(pin), initial_level);
+    }
+
 public:
     SynchronizedMotorSystem() : motors{MotorController(0), MotorController(1), MotorController(2)}
     {
@@ -872,41 +885,20 @@ public:
 
     void init_gpio_pins()
     {
-        // Configurar pines de dirección
+        // Configurar pines de dirección (inicializar en LOW)
         for (int i = 0; i < MOTOR_COUNT; i++)
         {
-            gpio_config_t dir_conf = {};
-            dir_conf.pin_bit_mask = (1ULL << DIR_PINS[i]);
-            dir_conf.mode = GPIO_MODE_OUTPUT;
-            dir_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-            dir_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-            dir_conf.intr_type = GPIO_INTR_DISABLE;
-            ESP_ERROR_CHECK(gpio_config(&dir_conf));
-            gpio_set_level(static_cast<gpio_num_t>(DIR_PINS[i]), 0); // Inicializar en LOW
+            configure_gpio_pin(DIR_PINS[i], GPIO_MODE_OUTPUT, 0);
         }
 
-        // Configurar pines de habilitación
+        // Configurar pines de habilitación (inicializar deshabilitado - HIGH)
         for (int i = 0; i < MOTOR_COUNT; i++)
         {
-            gpio_config_t enable_conf = {};
-            enable_conf.pin_bit_mask = (1ULL << ENABLE_PINS[i]);
-            enable_conf.mode = GPIO_MODE_OUTPUT;
-            enable_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-            enable_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-            enable_conf.intr_type = GPIO_INTR_DISABLE;
-            ESP_ERROR_CHECK(gpio_config(&enable_conf));
-            gpio_set_level(static_cast<gpio_num_t>(ENABLE_PINS[i]), 1); // Inicializar deshabilitado (HIGH)
+            configure_gpio_pin(ENABLE_PINS[i], GPIO_MODE_OUTPUT, 1);
         }
         
-        // Configurar pin del spindle
-        gpio_config_t spindle_conf = {};
-        spindle_conf.pin_bit_mask = (1ULL << SPINDLE_PIN);
-        spindle_conf.mode = GPIO_MODE_OUTPUT;
-        spindle_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-        spindle_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-        spindle_conf.intr_type = GPIO_INTR_DISABLE;
-        ESP_ERROR_CHECK(gpio_config(&spindle_conf));
-        gpio_set_level(static_cast<gpio_num_t>(SPINDLE_PIN), 0); // Inicializar apagado (LOW)
+        // Configurar pin del spindle (inicializar apagado - LOW)
+        configure_gpio_pin(SPINDLE_PIN, GPIO_MODE_OUTPUT, 0);
         
         ESP_LOGI(TAG, "Pines de dirección, habilitación y spindle inicializados");
     }
